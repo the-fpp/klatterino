@@ -1,0 +1,157 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -162 +162 @@ message(STATUS "Qt version: ${Qt${MAJOR_QT_VERSION}_VERSION}")
+-if(WIN32)
++if(WIN32 AND NOT MINGW)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -1072 +1072 @@ target_link_libraries(${LIBRARY_PROJECT}
+-        $<$<BOOL:${WIN32}>:Wtsapi32>
++        $<$<BOOL:${WIN32}>:wtsapi32>
+@@ -1136 +1136 @@ if (BUILD_APP)
+-    if (WIN32)
++    if (WIN32 AND NOT CMAKE_CROSSCOMPILING)
+@@ -1206 +1206,8 @@ if (BUILD_APP)
+-    elseif (APPLE)
++    elseif (WIN32)
++        # A non-Windows build host cannot execute windeployqt or CMake's
++        # RUNTIME_DEPENDENCIES scanner for a PE target. The packaging
++        # derivation assembles and audits the target DLL/plugin closure.
++        install(TARGETS ${EXECUTABLE_PROJECT}
++                RUNTIME DESTINATION bin
++                COMPONENT ${PROJECT_NAME})
++    elseif (APPLE)
+@@ -1372,5 +1379,10 @@ endif ()
+-if (WIN32)
++if (WIN32 AND NOT MINGW)
+     target_link_libraries(${LIBRARY_PROJECT}
+         PUBLIC
+         WinToast)
+ endif ()
++
++if (MINGW)
++    target_link_libraries(${LIBRARY_PROJECT} PUBLIC
++        dwmapi ole32 psapi shell32 shlwapi)
++endif ()
+diff --git a/src/singletons/Toasts.cpp b/src/singletons/Toasts.cpp
+--- a/src/singletons/Toasts.cpp
++++ b/src/singletons/Toasts.cpp
+@@ -22 +22 @@
+-#ifdef Q_OS_WIN
++#if defined(Q_OS_WIN) && !defined(__MINGW32__)
+@@ -144 +144 @@ namespace chatterino {
+-#ifdef Q_OS_WIN
++#if defined(Q_OS_WIN) && !defined(__MINGW32__)
+@@ -151 +151 @@ Toasts::~Toasts()
+-#ifdef Q_OS_WIN
++#if defined(Q_OS_WIN) && !defined(__MINGW32__)
+@@ -170 +170 @@ bool Toasts::isEnabled()
+-#ifdef Q_OS_WIN
++#if defined(Q_OS_WIN) && !defined(__MINGW32__)
+@@ -208 +208 @@ void Toasts::sendChannelNotification(const QString &channelName,
+-#ifdef Q_OS_WIN
++#if defined(Q_OS_WIN) && !defined(__MINGW32__)
+@@ -245 +245 @@ void Toasts::sendChannelNotification(const QString &channelName,
+-#ifdef Q_OS_WIN
++#if defined(Q_OS_WIN) && !defined(__MINGW32__)
+diff --git a/src/singletons/Toasts.hpp b/src/singletons/Toasts.hpp
+--- a/src/singletons/Toasts.hpp
++++ b/src/singletons/Toasts.hpp
+@@ -34 +34 @@ private:
+-#ifdef Q_OS_WIN
++#if defined(Q_OS_WIN) && !defined(__MINGW32__)
+diff --git a/lib/settings/src/settings/detail/rename.cpp b/lib/settings/src/settings/detail/rename.cpp
+--- a/lib/settings/src/settings/detail/rename.cpp
++++ b/lib/settings/src/settings/detail/rename.cpp
+@@ -5 +5 @@
+-#include <Windows.h>
++#include <windows.h>
+diff --git a/src/singletons/StreamerMode.cpp b/src/singletons/StreamerMode.cpp
+--- a/src/singletons/StreamerMode.cpp
++++ b/src/singletons/StreamerMode.cpp
+@@ -23 +23 @@
+-#    include <Windows.h>
++#    include <windows.h>
+@@ -24,2 +24,2 @@
+-#    include <VersionHelpers.h>
+-#    include <WtsApi32.h>
++#    include <versionhelpers.h>
++#    include <wtsapi32.h>
+diff --git a/src/widgets/AttachedWindow.cpp b/src/widgets/AttachedWindow.cpp
+--- a/src/widgets/AttachedWindow.cpp
++++ b/src/widgets/AttachedWindow.cpp
+@@ -23,2 +23,2 @@
+-#    include "Windows.h"
+-#    include "Psapi.h"
++#    include "windows.h"
++#    include "psapi.h"
+diff --git a/src/widgets/BaseWindow.cpp b/src/widgets/BaseWindow.cpp
+--- a/src/widgets/BaseWindow.cpp
++++ b/src/widgets/BaseWindow.cpp
+@@ -33,2 +33,2 @@
+-#    include <VersionHelpers.h>
+-#    include <Windows.h>
++#    include <versionhelpers.h>
++#    include <windows.h>
+diff --git a/src/widgets/OverlayWindow.cpp b/src/widgets/OverlayWindow.cpp
+--- a/src/widgets/OverlayWindow.cpp
++++ b/src/widgets/OverlayWindow.cpp
+@@ -33 +33 @@
+-#    include <Windows.h>
++#    include <windows.h>
+diff --git a/src/widgets/dialogs/LoginDialog.cpp b/src/widgets/dialogs/LoginDialog.cpp
+--- a/src/widgets/dialogs/LoginDialog.cpp
++++ b/src/widgets/dialogs/LoginDialog.cpp
+@@ -20 +20 @@
+-#    include <Windows.h>
++#    include <windows.h>
+diff --git a/src/widgets/buttons/TitlebarButtons.cpp b/src/widgets/buttons/TitlebarButtons.cpp
+--- a/src/widgets/buttons/TitlebarButtons.cpp
++++ b/src/widgets/buttons/TitlebarButtons.cpp
+@@ -11 +11 @@
+-#    include <Windows.h>
++#    include <windows.h>
+diff --git a/src/widgets/FramelessEmbedWindow.cpp b/src/widgets/FramelessEmbedWindow.cpp
+--- a/src/widgets/FramelessEmbedWindow.cpp
++++ b/src/widgets/FramelessEmbedWindow.cpp
+@@ -18 +18 @@
+-#    include "Windows.h"
++#    include "windows.h"
+diff --git a/src/util/WindowsHelper.hpp b/src/util/WindowsHelper.hpp
+--- a/src/util/WindowsHelper.hpp
++++ b/src/util/WindowsHelper.hpp
+@@ -10 +10 @@
+-#    include <Windows.h>
++#    include <windows.h>
+diff --git a/src/util/WindowsHelper.cpp b/src/util/WindowsHelper.cpp
+--- a/src/util/WindowsHelper.cpp
++++ b/src/util/WindowsHelper.cpp
+@@ -17,4 +17,4 @@
+-#    include <Ole2.h>
+-#    include <ShellScalingApi.h>
+-#    include <Shlwapi.h>
+-#    include <VersionHelpers.h>
++#    include <ole2.h>
++#    include <shellscalingapi.h>
++#    include <shlwapi.h>
++#    include <versionhelpers.h>
+diff --git a/src/util/RenameThread.cpp b/src/util/RenameThread.cpp
+--- a/src/util/RenameThread.cpp
++++ b/src/util/RenameThread.cpp
+@@ -11 +11 @@
+-#    include <Windows.h>
++#    include <windows.h>
+diff --git a/src/util/AttachToConsole.cpp b/src/util/AttachToConsole.cpp
+--- a/src/util/AttachToConsole.cpp
++++ b/src/util/AttachToConsole.cpp
+@@ -8 +8 @@
+-#    include <Windows.h>
++#    include <windows.h>
+diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -34 +34 @@
+-#    include <shobjidl_core.h>
++#    include <shobjidl.h>

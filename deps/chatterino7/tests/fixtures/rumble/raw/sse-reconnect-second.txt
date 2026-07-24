@@ -1,0 +1,5 @@
+data: {"type":"init","data":{"users":[{"id":"u_fixture","username":"fixture-user"}],"channels":[{"id":"c_fixture","username":"Fixture Channel"}],"config":{"badges":{},"message_length_max":200},"messages":[{"id":"m1","user_id":"u_fixture","channel_id":"c_fixture","text":"fixture first window","time":"2026-01-01T00:00:00Z","blocks":[]}]}}
+
+data: {"type":"messages","data":{"messages":[{"id":"m2","user_id":"u_fixture","channel_id":"c_fixture","text":"fixture after reconnect","time":"2026-01-01T00:00:02Z","blocks":[]}]}}
+
+: fixture end

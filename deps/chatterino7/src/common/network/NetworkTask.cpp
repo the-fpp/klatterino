@@ -1,0 +1,295 @@
+// SPDX-FileCopyrightText: 2024 Contributors to Chatterino <https://chatterino.com>
+//
+// SPDX-License-Identifier: MIT
+
+#include "common/network/NetworkTask.hpp"
+
+#include "Application.hpp"
+#include "common/network/NetworkManager.hpp"
+#include "common/network/NetworkPrivate.hpp"
+#include "common/network/NetworkResult.hpp"
+#include "common/QLogging.hpp"
+#include "singletons/Paths.hpp"
+#include "util/AbandonObject.hpp"
+#include "util/DebugCount.hpp"
+
+#include <QFile>
+#include <QNetworkReply>
+#include <QtConcurrent>
+
+#ifndef signals
+#    define signals public  // the file uses signals: but we build without that
+#endif
+#include <private/qnetworkreplyhttpimpl_p.h>  // for QNetworkReplyHttpImplPrivate
+#undef signals
+
+namespace {
+
+/// For DELETE requests, Qt remaps the operation to `DeleteOperation`:
+/// https://github.com/qt/qtbase/blob/bc60fa052b6163bcf444dab027bd6c1e717c9845/src/network/access/qnetworkreplyhttpimpl.cpp#L141-L161
+/// If we specified a body on the request. That will get dropped, because
+/// `DeleteOperation` has a special handler that won't use the body.
+void forceCustomOperation(QNetworkReply *reply)
+{
+    // We can't use dynamic_cast here, since some Qt builds are without RTTI.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    auto *d = static_cast<QNetworkReplyPrivate *>(QObjectPrivate::get(reply));
+    if (!d)
+    {
+        return;  // not an HTTP request?
+    }
+    d->operation = QNetworkAccessManager::CustomOperation;
+}
+
+}  // namespace
+
+namespace chatterino::network::detail {
+
+NetworkTask::NetworkTask(std::shared_ptr<NetworkData> &&data)
+    : data_(std::move(data))
+{
+}
+
+NetworkTask::~NetworkTask()
+{
+    if (this->reply_)
+    {
+        this->reply_->deleteLater();
+    }
+}
+
+void NetworkTask::run()
+{
+    this->reply_ = this->createReply();
+    if (!this->reply_)
+    {
+        this->deleteLater();
+        return;
+    }
+
+    const auto &timeout = this->data_->timeout;
+    if (timeout.has_value())
+    {
+        QObject::connect(this->reply_, &QNetworkReply::requestSent, this,
+                         [this]() {
+                             const auto &timeout = this->data_->timeout;
+                             this->timer_ = new QTimer(this);
+                             this->timer_->setSingleShot(true);
+                             this->timer_->start(timeout.value());
+                             QObject::connect(this->timer_, &QTimer::timeout,
+                                              this, &NetworkTask::timeout);
+                         });
+    }
+
+    QObject::connect(this->reply_, &QNetworkReply::finished, this,
+                     &NetworkTask::finished);
+
+#ifndef NDEBUG
+    if (this->data_->ignoreSslErrors)
+    {
+        QObject::connect(this->reply_, &QNetworkReply::sslErrors, this,
+                         [this](const auto &errors) {
+                             this->reply_->ignoreSslErrors(errors);
+                         });
+    }
+#endif
+}
+
+QNetworkReply *NetworkTask::createReply()
+{
+    const auto &data = this->data_;
+    const auto &request = this->data_->request;
+    auto *accessManager = NetworkManager::accessManager;
+    switch (this->data_->requestType)
+    {
+        case NetworkRequestType::Get:
+            return accessManager->get(request);
+
+        case NetworkRequestType::Delete: {
+            if (data->payload.isEmpty())
+            {
+                return accessManager->deleteResource(request);
+            }
+
+            auto *reply = accessManager->sendCustomRequest(request, "DELETE",
+                                                           data->payload);
+            if (!reply)
+            {
+                return reply;
+            }
+            forceCustomOperation(reply);
+            return reply;
+        }
+
+        case NetworkRequestType::Put:
+            if (data->multiPartPayload)
+            {
+                assert(data->payload.isNull());
+
+                return accessManager->put(request,
+                                          data->multiPartPayload.get());
+            }
+            else
+            {
+                assert(data->multiPartPayload == nullptr);
+
+                return accessManager->put(request, data->payload);
+            }
+
+        case NetworkRequestType::Post:
+            if (data->multiPartPayload)
+            {
+                assert(data->payload.isNull());
+
+                return accessManager->post(request,
+                                           data->multiPartPayload.get());
+            }
+            else
+            {
+                assert(data->multiPartPayload == nullptr);
+
+                return accessManager->post(request, data->payload);
+            }
+
+        case NetworkRequestType::Patch:
+            if (data->multiPartPayload)
+            {
+                assert(data->payload.isNull());
+
+                return accessManager->sendCustomRequest(
+                    request, "PATCH", data->multiPartPayload.get());
+            }
+            else
+            {
+                assert(data->multiPartPayload == nullptr);
+
+                return NetworkManager::accessManager->sendCustomRequest(
+                    request, "PATCH", data->payload);
+            }
+    }
+    return nullptr;
+}
+
+void NetworkTask::logReply()
+{
+    auto status =
+        this->reply_->attribute(QNetworkRequest::HttpStatusCodeAttribute)
+            .toInt();
+    if (this->data_->requestType == NetworkRequestType::Get)
+    {
+        qCDebug(chatterinoHTTP).noquote()
+            << this->data_->typeString() << status
+            << this->data_->request.url().toString();
+    }
+    else
+    {
+        QUtf8StringView payload = this->data_->payload;
+#if defined(NDEBUG) || QT_VERSION < QT_VERSION_CHECK(6, 10, 0)
+        if (this->data_->hideRequestBody)
+#else
+        static bool alwaysShowRequestBodies =
+            qEnvironmentVariableIntegerValue(
+                "CHATTERINO_HTTP_ALWAYS_SHOW_REQUEST_BODY")
+                .value_or(0) != 0;
+        if (this->data_->hideRequestBody && !alwaysShowRequestBodies)
+#endif
+        {
+            payload = "(redacted)";
+        }
+        qCDebug(chatterinoHTTP).noquote()
+            << this->data_->typeString()
+            << this->data_->request.url().toString() << status << payload;
+    }
+}
+
+void NetworkTask::writeToCache(const QByteArray &bytes) const
+{
+    std::ignore = QtConcurrent::run([data = this->data_, bytes] {
+        if (isAppAboutToQuit())
+        {
+            qCDebug(chatterinoHTTP)
+                << "Skipping cache write for" << data->request.url()
+                << "because app is about to quit";
+            return;
+        }
+
+        auto *app = tryGetApp();
+        if (!app)
+        {
+            qCDebug(chatterinoHTTP)
+                << "Skipping cache write for" << data->request.url()
+                << "because app is null";
+            return;
+        }
+
+        QFile cachedFile(app->getPaths().cacheDirectory() + "/" +
+                         data->getHash());
+
+        if (cachedFile.open(QIODevice::WriteOnly))
+        {
+            cachedFile.write(bytes);
+        }
+    });
+}
+
+void NetworkTask::timeout()
+{
+    AbandonObject guard(this);
+
+    // prevent abort() from calling finished()
+    QObject::disconnect(this->reply_, &QNetworkReply::finished, this,
+                        &NetworkTask::finished);
+    this->reply_->abort();
+
+    qCDebug(chatterinoHTTP).noquote()
+        << this->data_->typeString() << "[timed out]"
+        << this->data_->request.url().toString();
+
+    this->data_->emitError({NetworkResult::NetworkError::TimeoutError, {}, {}});
+    this->data_->emitFinally();
+}
+
+void NetworkTask::finished()
+{
+    AbandonObject guard(this);
+
+    if (this->timer_)
+    {
+        this->timer_->stop();
+    }
+
+    auto *reply = this->reply_;
+    auto status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+
+    if (reply->error() == QNetworkReply::OperationCanceledError)
+    {
+        // Operation cancelled, most likely timed out
+        qCDebug(chatterinoHTTP).noquote()
+            << this->data_->typeString() << "[cancelled]"
+            << this->data_->request.url().toString();
+        return;
+    }
+
+    if (reply->error() != QNetworkReply::NoError)
+    {
+        this->logReply();
+        this->data_->emitError({reply->error(), status, reply->readAll()});
+        this->data_->emitFinally();
+
+        return;
+    }
+
+    QByteArray bytes = reply->readAll();
+
+    if (this->data_->cache)
+    {
+        this->writeToCache(bytes);
+    }
+
+    DebugCount::increase(DebugObject::HTTPRequestSuccess);
+    this->logReply();
+    this->data_->emitSuccess({reply->error(), status, bytes});
+    this->data_->emitFinally();
+}
+
+}  // namespace chatterino::network::detail

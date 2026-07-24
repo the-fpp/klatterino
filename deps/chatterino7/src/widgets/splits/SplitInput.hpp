@@ -1,0 +1,314 @@
+// SPDX-FileCopyrightText: 2017 Contributors to Chatterino <https://chatterino.com>
+//
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
+#include "messages/MessageDraftTracker.hpp"
+#include "messages/Message.hpp"
+#include "widgets/BaseWidget.hpp"
+
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
+#include <QPaintEvent>
+#include <QPointer>
+#include <QPropertyAnimation>
+#include <QTextEdit>
+#include <QVBoxLayout>
+#include <QWidget>
+
+#include <cstddef>
+#include <memory>
+
+namespace chatterino {
+
+class Split;
+class EmotePopup;
+class InputCompletionPopup;
+class InputHighlighter;
+class MessageView;
+class LabelButton;
+class PixmapButton;
+class ResizingTextEdit;
+class ChannelView;
+class SvgButton;
+class SpellCheckHighlighter;
+class Channel;
+struct Link;
+enum class CompletionKind;
+
+class SplitInput : public BaseWidget
+{
+    Q_OBJECT
+
+public:
+    SplitInput(Split *_chatWidget, bool enableInlineReplying = true);
+    SplitInput(QWidget *parent, Split *_chatWidget, ChannelView *_channelView,
+               bool enableInlineReplying = true);
+
+    bool hasSelection() const;
+    void clearSelection() const;
+
+    bool isEditFirstWord() const;
+    QString getInputText() const;
+    void insertText(const QString &text);
+
+    void setReply(MessagePtr target, std::weak_ptr<Channel> channel);
+    void setPlaceholderText(const QString &text);
+
+    /**
+     * @brief Hide the widget
+     *
+     * This is a no-op if the SplitInput is already hidden
+     **/
+    void hide();
+
+    /**
+     * @brief Show the widget
+     *
+     * This is a no-op if the SplitInput is already shown
+     **/
+    void show();
+
+    /**
+     * @brief Returns the hidden or shown state of the SplitInput
+     *
+     * Hidden in this context means "has 0 height", meaning it won't be visible
+     * but Qt still treats the widget as "technically visible" so we receive events
+     * as if the widget is visible
+     **/
+    bool isHidden() const;
+
+    bool isInHistorySearch() const;
+
+    /**
+     * @brief Sets the text of this input
+     *
+     * This method should only be used in tests
+     */
+    void setInputText(const QString &newInputText);
+
+    /**
+     * @brief Sets a formatted time to sendWaitStatus
+     *
+     * This method is used to update the text of the timeout and slow mode timer
+     */
+    void setSendWaitStatus(const QString &text) const;
+
+    void triggerSelfMessageReceived();
+
+    std::optional<bool> checkSpellingOverride() const;
+    void setCheckSpellingOverride(std::optional<bool> override);
+
+    pajlada::Signals::Signal<const QString &> textChanged;
+    pajlada::Signals::NoArgSignal selectionChanged;
+    pajlada::Signals::NoArgSignal historySearchStateChanged;
+
+protected:
+    void scaleChangedEvent(float scale_) override;
+    void themeChangedEvent() override;
+
+    void paintEvent(QPaintEvent * /*event*/) override;
+    void resizeEvent(QResizeEvent * /*event*/) override;
+
+    void mousePressEvent(QMouseEvent *event) override;
+
+    virtual void giveFocus(Qt::FocusReason reason);
+    virtual bool shouldRestoreFocus(
+        const QPointer<QWidget> &focusAtSubmission) const;
+    QString handleSendMessage(const std::vector<QString> &arguments);
+    void postMessageSend(const QString &message,
+                         const std::vector<QString> &arguments,
+                         bool restoreFocus = true);
+
+    /// Clears the input box, clears reply target if inline replies are enabled
+    void clearInput();
+
+    void addShortcuts() override;
+    void initLayout();
+    bool eventFilter(QObject *obj, QEvent *event) override;
+    void installTextEditEvents();
+    void onCursorPositionChanged();
+    void onTextChanged();
+    void updateEmoteButton();
+    void updateRoutingPlatformButton();
+    bool cycleDraftRoutingOverride(bool reverse);
+    const std::optional<QString> &effectiveRoutingPlatformOverride() const;
+    void rebuildRoutingPlatformMenu();
+    void refreshRoutingPlatformAvailability();
+    void setRoutingPlatformOverride(std::optional<QString> platform);
+    MessageDraft currentMessageDraft(QString text) const;
+    void updateCompletionPopup();
+    void showCompletionPopup(const QString &text, CompletionKind kind);
+    void hideCompletionPopup();
+    void insertCompletionText(
+        const QString &input_,
+        const std::optional<DraftEmoteCandidate> &candidate = std::nullopt,
+        bool provenanceAmbiguous = false);
+    void insertEmotePopupSelection(
+        const Link &link,
+        const std::optional<DraftEmoteCandidate> &candidate,
+        bool provenanceAmbiguous);
+    void openEmotePopup();
+    virtual void closeEmotePopup();
+    void clearReplyTarget();
+    void selectPreviousMessage();
+    void selectNextMessage();
+    QString formatHistoryMessageForReply(const QString &message) const;
+    void resetReplyHistoryNavigation();
+    bool handleEmptyBackspaceReply(bool reverse);
+    bool replyToRecentMentionOrCycle(size_t limit, bool reverse);
+
+    void updateCancelReplyButton();
+
+    // scaledMaxHeight returns the height in pixels that this widget can grow to
+    // This does not take hidden into account, so callers must take hidden into account themselves
+    int scaledMaxHeight() const;
+
+    // Returns true if the channel this input is connected to is a Twitch channel,
+    // the user's setting is set to Prevent, and the given text goes beyond the Twitch message length limit
+    bool shouldPreventInput(const QString &text) const;
+
+    int marginForTheme() const;
+
+    void applyOuterMargin();
+
+    int replyMessageWidth() const;
+
+    Split *const split_;
+    ChannelView *const channelView_;
+    QPointer<EmotePopup> emotePopup_;
+    QPointer<InputCompletionPopup> inputCompletionPopup_;
+
+    struct {
+        // vbox for all components
+        QVBoxLayout *vbox;
+
+        // reply widgets
+        QWidget *replyWrapper;
+        QVBoxLayout *replyVbox;
+        QHBoxLayout *replyHbox;
+        MessageView *replyMessage;
+        QLabel *replyLabel;
+        SvgButton *cancelReplyButton;
+
+        // input widgets
+        QWidget *inputWrapper;
+        QHBoxLayout *inputHbox;
+        QWidget *automaticRoutingIndicator;
+        ResizingTextEdit *textEdit;
+        PixmapButton *routingPlatformButton;
+        QLabel *routingTemporaryMarker;
+        QLabel *textEditLength;
+        LabelButton *sendButton;
+        QLabel *sendWaitStatus;
+        SvgButton *emoteButton;
+        QWidget *historySearchWrap;
+        QLineEdit *historySearchInput;
+        QLabel *historySearchLabel;
+    } ui_;
+
+    MessagePtr replyTarget_ = nullptr;
+    std::weak_ptr<Channel> replyChannel_;
+    bool enableInlineReplying_;
+
+    pajlada::Signals::SignalHolder managedConnections_;
+    pajlada::Signals::SignalHolder channelConnections_;
+    QStringList prevMsg_;
+    QString currMsg_;
+    int prevIndex_ = 0;
+    MessagePtr historyReplyTarget_;
+    MessageDraftTracker draftTracker_;
+    std::optional<QString> routingPlatformOverride_;
+    std::optional<QString> draftRoutingPlatformOverride_;
+    bool draftRoutingOverrideActive_ = false;
+    /// Last document snapshots observed by the document change hook. Qt emits
+    /// contentsChange for both text and formatting updates, sometimes with
+    /// non-zero removed/added counts for formatting. Comparing both snapshots
+    /// preserves provenance for a pure format change while still forwarding an
+    /// identical text replacement whose serialized formatting is unchanged.
+    QString trackedDocumentText_;
+    QString trackedDocumentRichText_;
+
+    // Hidden denotes whether this split input should be hidden or not
+    // This is used instead of the regular QWidget::hide/show because
+    // focus events don't work as expected, so instead we use this bool and
+    // set the height of the split input to 0 if we're supposed to be hidden instead
+    bool hidden{false};
+
+    /// Updates the text edit palette using the current theme
+    /// and current "backgroundColor" property
+    void updateTextEditPalette();
+
+    // the background color defines the current background color of this split input
+    // instead of reading straight from the theme, we store a property here
+    // to be used by a property to be able to pulse a highlight color on demand
+    Q_PROPERTY(
+        QColor backgroundColor READ backgroundColor WRITE setBackgroundColor);
+
+    QColor backgroundColor_{"#000000"};
+    QColor backgroundColor() const;
+    void setBackgroundColor(QColor newColor);
+
+    QPropertyAnimation backgroundColorAnimation;
+
+    std::optional<bool> checkSpellingOverride_;
+    bool shouldCheckSpelling() const;
+    void checkSpellingChanged();
+
+    InputHighlighter *inputHighlighter = nullptr;
+
+    void updateFonts();
+
+    bool inHistorySearch = false;
+
+    void startHistorySearch(bool backwards, bool loop);
+    void stopHistorySearchIfNecessary();
+
+    /// Search through all previous messages for `historySearchQuery`
+    void refreshHistorySearch(bool backwards, bool loop);
+
+    void cycleHistorySearch(bool backwards, bool loop);
+    void loopHistorySearchIfNeeded(bool backwards);
+
+    /// Show the currently selected message in the input box
+    void updateSelectedHistorySearchMatch();
+
+    void updateHistorySearchStatus(bool failed, const QString &message);
+
+    QString historySearchQuery;
+
+    struct HistorySearchResult {
+        /// Index of the message in `prevMsg_`
+        qsizetype messageIdx = 0;
+        QString message;
+    };
+    std::vector<HistorySearchResult> historySearchResults;
+
+    /// Index into `historySearchResults`
+    /// This might be out of bounds if there's no match.
+    qsizetype historySearchResultIndex = -1;
+
+    bool historySearchFailed = false;
+
+    bool lastHistorySearchBackwards = false;
+    bool lastHistorySearchLoop = false;
+
+    /// `prevIndex_` value before a history search was started.
+    ///
+    /// The history search modifies `prevIndex_`, but we need this anchor when
+    /// the user updates the query.
+    int prevIndexBeforeSearch = 0;
+
+private Q_SLOTS:
+    void editTextChanged();
+
+    void updateChannel();
+
+    friend class Split;
+    friend class ResizingTextEdit;
+    friend class ReplyThreadPopup;
+};
+
+}  // namespace chatterino

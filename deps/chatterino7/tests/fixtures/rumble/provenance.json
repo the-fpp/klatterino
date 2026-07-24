@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "reviewed_on": "2026-07-17",
+  "source": "Hand-authored from the sanitized observations in docs/rumble-protocol.md, including the 2026-07-17 inline RumbleChat client contract; no raw capture retained",
+  "fixtures": [
+    {
+      "resource": ":/rumble/raw/channel-live.html",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "text/html; charset=utf-8",
+      "replacements": ["channel name", "duration", "embed ID", "page content"],
+      "consumers": ["PreservesRawHttpAndSseBoundaries", "DrivesCompleteRawLiveSession"]
+    },
+    {
+      "resource": ":/rumble/raw/channel-offline.html",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "text/html; charset=utf-8",
+      "replacements": ["channel name", "duration", "embed ID", "page content"],
+      "consumers": ["ScriptsOfflineAndHttpFailuresIndependently"]
+    },
+    {
+      "resource": ":/rumble/raw/embed-live.json",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "application/json",
+      "replacements": ["stream ID", "stream title"],
+      "consumers": ["PreservesRawHttpAndSseBoundaries", "DrivesCompleteRawLiveSession"]
+    },
+    {
+      "resource": ":/rumble/raw/embed-offline.json",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "application/json",
+      "replacements": ["all identifiers"],
+      "consumers": ["ScriptsOfflineAndHttpFailuresIndependently"]
+    },
+    {
+      "resource": ":/rumble/raw/sse-live.txt",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "text/event-stream",
+      "replacements": ["user IDs", "channel IDs", "message IDs", "display text", "timestamps"],
+      "consumers": ["PreservesRawHttpAndSseBoundaries", "DrivesCompleteRawLiveSession"]
+    },
+    {
+      "resource": ":/rumble/raw/sse-reconnect-first.txt",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "text/event-stream",
+      "replacements": ["user IDs", "channel IDs", "message IDs", "display text", "timestamps"],
+      "consumers": ["ReconnectSequenceIsFiniteAndDeterministic"]
+    },
+    {
+      "resource": ":/rumble/raw/sse-reconnect-second.txt",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "text/event-stream",
+      "replacements": ["user IDs", "channel IDs", "message IDs", "display text", "timestamps"],
+      "consumers": ["ReconnectSequenceIsFiniteAndDeterministic"]
+    },
+    {
+      "resource": ":/rumble/raw/sse-malformed.txt",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "text/event-stream",
+      "replacements": ["entire payload hand-authored as invalid JSON"],
+      "consumers": ["PreservesAdversarialSseInputs"]
+    },
+    {
+      "resource": ":/rumble/raw/sse-duplicate.txt",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "text/event-stream",
+      "replacements": ["user IDs", "channel IDs", "message IDs", "display text", "timestamps"],
+      "consumers": ["PreservesAdversarialSseInputs"]
+    },
+    {
+      "resource": ":/rumble/raw/sse-out-of-order.txt",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "text/event-stream",
+      "replacements": ["user IDs", "channel IDs", "message IDs", "display text", "timestamps"],
+      "consumers": ["PreservesAdversarialSseInputs"]
+    },
+    {
+      "resource": ":/rumble/raw/sse-unknown.txt",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "text/event-stream",
+      "replacements": ["event type", "entire payload"],
+      "consumers": ["PreservesAdversarialSseInputs"]
+    },
+    {
+      "resource": ":/rumble/raw/sse-delayed.txt",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "text/event-stream",
+      "replacements": ["user IDs", "channel IDs", "message IDs", "display text", "timestamps"],
+      "consumers": ["DelayedDeliveryUsesOnlyVirtualTime", "CancellationReleasesCallbacksAndTimers", "CancelledGenerationCannotCompleteStale", "DestructionCancelsPendingConsumerLifetime"]
+    },
+    {
+      "resource": ":/rumble/raw/http-error.json",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [403, 404, 429, 503],
+      "content_type": "application/json",
+      "replacements": ["entire error message", "all server details"],
+      "consumers": ["ScriptsOfflineAndHttpFailuresIndependently"]
+    },
+    {
+      "resource": ":/rumble/raw/sse-state-events.txt",
+      "classification": "public",
+      "method": "GET",
+      "statuses": [200],
+      "content_type": "text/event-stream",
+      "replacements": ["user IDs", "channel IDs", "message IDs", "display text", "timestamps"],
+      "consumers": ["RumbleEventParser.ParsesStateOperationFixture"]
+    },
+    {
+      "resource": ":/rumble/raw/session-expired.json",
+      "classification": "authenticated-shape-only",
+      "method": "GET",
+      "statuses": [401],
+      "content_type": "application/json",
+      "replacements": ["account data", "session credential", "entire error message"],
+      "consumers": ["ScriptsOfflineAndHttpFailuresIndependently"]
+    }
+  ]
+}

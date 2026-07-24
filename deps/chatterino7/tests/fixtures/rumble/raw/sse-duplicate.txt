@@ -1,0 +1,5 @@
+data: {"type":"messages","data":{"messages":[{"id":"m_duplicate","user_id":"u_fixture","channel_id":"c_fixture","text":"fixture duplicate","time":"2026-01-01T00:00:03Z","blocks":[]}]}}
+
+data: {"type":"messages","data":{"messages":[{"id":"m_duplicate","user_id":"u_fixture","channel_id":"c_fixture","text":"fixture duplicate","time":"2026-01-01T00:00:03Z","blocks":[]}]}}
+
+: fixture end

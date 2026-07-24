@@ -1,0 +1,130 @@
+// SPDX-FileCopyrightText: 2018 Contributors to Chatterino <https://chatterino.com>
+//
+// SPDX-License-Identifier: MIT
+
+#include "controllers/accounts/AccountController.hpp"
+
+#include "controllers/accounts/Account.hpp"
+#include "controllers/accounts/AccountModel.hpp"
+#include "providers/kick/KickAccount.hpp"
+#include "providers/rumble/RumbleAccount.hpp"
+#include "providers/twitch/TwitchAccount.hpp"
+#include "util/SharedPtrElementLess.hpp"
+
+#include <QCoreApplication>
+
+namespace chatterino {
+
+AccountController::AccountController()
+    : rumble(QCoreApplication::instance())
+    , accounts_(SharedPtrElementLess<Account>{})
+{
+    // These signal connections can safely be ignored since the twitch object
+    // will always be destroyed before the AccountController
+    std::ignore =
+        this->twitch.accounts.itemInserted.connect([this](const auto &args) {
+            this->accounts_.insert(args.item);
+        });
+
+    std::ignore =
+        this->twitch.accounts.itemRemoved.connect([this](const auto &args) {
+            if (args.caller != this)
+            {
+                this->accounts_.removeFirstMatching(
+                    [&](const auto &item) {
+                        return item == args.item;
+                    },
+                    this);
+            }
+        });
+
+    std::ignore =
+        this->kick.accounts.itemInserted.connect([this](const auto &args) {
+            this->accounts_.insert(args.item);
+        });
+
+    std::ignore =
+        this->kick.accounts.itemRemoved.connect([this](const auto &args) {
+            if (args.caller != this)
+            {
+                this->accounts_.removeFirstMatching(
+                    [&](const auto &item) {
+                        return item == args.item;
+                    },
+                    this);
+            }
+        });
+
+    std::ignore =
+        this->rumble.accounts.itemInserted.connect([this](const auto &args) {
+            this->accounts_.insert(args.item);
+        });
+
+    std::ignore =
+        this->rumble.accounts.itemRemoved.connect([this](const auto &args) {
+            if (args.caller != this)
+            {
+                this->accounts_.removeFirstMatching(
+                    [&](const auto &item) {
+                        return item == args.item;
+                    },
+                    this);
+            }
+        });
+
+    std::ignore = this->accounts_.itemRemoved.connect([this](const auto &args) {
+        switch (args.item->getProviderId())
+        {
+            case ProviderId::Twitch: {
+                if (args.caller != this)
+                {
+                    this->twitch.accounts.removeFirstMatching(
+                        [&](const auto &item) {
+                            return item == args.item;
+                        },
+                        this);
+                }
+            }
+            break;
+            case ProviderId::Kick: {
+                if (args.caller != this)
+                {
+                    this->kick.accounts.removeFirstMatching(
+                        [&](const auto &item) {
+                            return item == args.item;
+                        },
+                        this);
+                }
+            }
+            break;
+            case ProviderId::Rumble: {
+                if (args.caller != this)
+                {
+                    this->rumble.accounts.removeFirstMatching(
+                        [&](const auto &item) {
+                            return item == args.item;
+                        },
+                        this);
+                }
+            }
+            break;
+        }
+    });
+}
+
+void AccountController::load()
+{
+    this->twitch.load();
+    this->kick.load();
+    this->rumble.load();
+}
+
+AccountModel *AccountController::createModel(QObject *parent)
+{
+    AccountModel *model = new AccountModel(parent);
+
+    model->initialize(&this->accounts_);
+    return model;
+}
+
+}  // namespace chatterino

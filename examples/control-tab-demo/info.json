@@ -1,0 +1,12 @@
+{
+  "name": "Control Tab Demo",
+  "description": "Generic declarative control-tab example and UI test fixture",
+  "authors": ["Chatterino contributors"],
+  "license": "MIT",
+  "version": "1.0.0",
+  "permissions": [
+    {
+      "type": "UiControlTabs"
+    }
+  ]
+}

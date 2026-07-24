@@ -1,0 +1,3 @@
+data: {"type":"messages","data":{"messages":[{"id":"m_delayed","user_id":"u_fixture","channel_id":"c_fixture","text":"fixture delayed","time":"2026-01-01T00:00:06Z","blocks":[]}]}}
+
+: fixture end

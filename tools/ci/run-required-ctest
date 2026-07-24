@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ctest_command="${CTEST_COMMAND:-ctest}"
+ctest_log_path="${CTEST_LOG_PATH:-/tmp/ctest.log}"
+
+"$ctest_command" "$@" 2>&1 | tee "$ctest_log_path"
+statuses=("${PIPESTATUS[@]}")
+ctest_status=${statuses[0]}
+tee_status=${statuses[1]}
+
+if ((ctest_status != 0)); then
+    exit "$ctest_status"
+fi
+
+exit "$tee_status"

@@ -1,0 +1,360 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "name": "live-session",
+      "exchanges": [
+        {
+          "label": "live-channel-page",
+          "request": {
+            "method": "GET",
+            "target": "/c/fixture-channel/live/",
+            "headers": [
+              {"name": "Accept", "value": "text/html"},
+              {"name": "User-Agent", "value": "chatterino-rumble/1"}
+            ]
+          },
+          "response": {
+            "status": 200,
+            "headers": [{"name": "Content-Type", "value": "text/html; charset=utf-8"}],
+            "chunks": [{"resource": ":/rumble/raw/channel-live.html"}],
+            "terminal": "complete"
+          }
+        },
+        {
+          "label": "embed-resolution",
+          "request": {
+            "method": "GET",
+            "target": "/embedJS/u3/?request=video&ver=2&v=vfixture",
+            "headers": [
+              {"name": "Accept", "value": "application/json"},
+              {"name": "User-Agent", "value": "chatterino-rumble/1"}
+            ]
+          },
+          "response": {
+            "status": 200,
+            "headers": [{"name": "Content-Type", "value": "application/json"}],
+            "chunks": [{"resource": ":/rumble/raw/embed-live.json"}],
+            "terminal": "complete"
+          }
+        },
+        {
+          "label": "live-sse",
+          "request": {
+            "method": "GET",
+            "target": "/chat/api/chat/1001/stream",
+            "headers": [
+              {"name": "Accept", "value": "text/event-stream"},
+              {"name": "Cache-Control", "value": "no-cache"},
+              {"name": "Origin", "value": "https://rumble.com"},
+              {"name": "Referer", "value": "https://rumble.com/"},
+              {"name": "User-Agent", "value": "chatterino-rumble/1"}
+            ]
+          },
+          "response": {
+            "status": 200,
+            "headers": [
+              {"name": "Content-Type", "value": "text/event-stream"},
+              {"name": "Cache-Control", "value": "no-cache"}
+            ],
+            "chunks": [
+              {"resource": ":/rumble/raw/sse-live.txt", "offset": 0, "length": 6},
+              {"resource": ":/rumble/raw/sse-live.txt", "offset": 6, "length": 37, "after_ms": 7},
+              {"resource": ":/rumble/raw/sse-live.txt", "offset": 43, "length": -1, "after_ms": 11}
+            ],
+            "terminal": "disconnect",
+            "terminal_after_ms": 3,
+            "terminal_reason": "fixture stream closed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "offline-page",
+      "exchanges": [{
+        "label": "offline-channel-page",
+        "request": {"method": "GET", "target": "/c/fixture-offline/live/"},
+        "response": {
+          "status": 200,
+          "headers": [{"name": "Content-Type", "value": "text/html; charset=utf-8"}],
+          "chunks": [{"resource": ":/rumble/raw/channel-offline.html"}],
+          "terminal": "complete"
+        }
+      }]
+    },
+    {
+      "name": "offline-sse-204",
+      "exchanges": [{
+        "label": "offline-sse",
+        "request": {
+          "method": "GET",
+          "target": "/chat/api/chat/1001/stream",
+          "headers": [{"name": "Accept", "value": "text/event-stream"}]
+        },
+        "response": {"status": 204, "headers": [], "terminal": "complete"}
+      }]
+    },
+    {
+      "name": "embed-unavailable",
+      "exchanges": [{
+        "label": "embed-unavailable",
+        "request": {"method": "GET", "target": "/embedJS/u3/?request=video&ver=2&v=vfixture"},
+        "response": {
+          "status": 200,
+          "headers": [{"name": "Content-Type", "value": "application/json"}],
+          "chunks": [{"resource": ":/rumble/raw/embed-offline.json"}],
+          "terminal": "complete"
+        }
+      }]
+    },
+    {
+      "name": "reconnect",
+      "exchanges": [
+        {
+          "label": "reconnect-first-stream",
+          "request": {
+            "method": "GET",
+            "target": "/chat/api/chat/1001/stream",
+            "headers": [{"name": "Accept", "value": "text/event-stream"}]
+          },
+          "response": {
+            "status": 200,
+            "headers": [{"name": "Content-Type", "value": "text/event-stream"}],
+            "chunks": [{"resource": ":/rumble/raw/sse-reconnect-first.txt"}],
+            "terminal": "disconnect",
+            "terminal_after_ms": 5,
+            "terminal_reason": "fixture reconnect boundary"
+          }
+        },
+        {
+          "label": "reconnect-second-stream",
+          "request": {
+            "method": "GET",
+            "target": "/chat/api/chat/1001/stream",
+            "headers": [{"name": "Accept", "value": "text/event-stream"}]
+          },
+          "response": {
+            "status": 200,
+            "headers": [{"name": "Content-Type", "value": "text/event-stream"}],
+            "chunks": [{"resource": ":/rumble/raw/sse-reconnect-second.txt"}],
+            "terminal": "complete"
+          }
+        }
+      ]
+    },
+    {
+      "name": "rate-limit",
+      "exchanges": [{
+        "label": "rate-limit",
+        "request": {"method": "GET", "target": "/fixture/rate-limit"},
+        "response": {
+          "status": 429,
+          "headers": [
+            {"name": "Content-Type", "value": "application/json"},
+            {"name": "Retry-After", "value": "3"}
+          ],
+          "chunks": [{"resource": ":/rumble/raw/http-error.json"}],
+          "terminal": "complete"
+        }
+      }]
+    },
+    {
+      "name": "authentication-failure",
+      "exchanges": [{
+        "label": "authentication-failure",
+        "request": {"method": "GET", "target": "/fixture/authentication"},
+        "response": {
+          "status": 401,
+          "headers": [{"name": "Content-Type", "value": "application/json"}],
+          "chunks": [{"resource": ":/rumble/raw/session-expired.json"}],
+          "terminal": "complete"
+        }
+      }]
+    },
+    {
+      "name": "authorization-failure",
+      "exchanges": [{
+        "label": "authorization-failure",
+        "request": {"method": "GET", "target": "/fixture/authorization"},
+        "response": {
+          "status": 403,
+          "headers": [{"name": "Content-Type", "value": "application/json"}],
+          "chunks": [{"resource": ":/rumble/raw/http-error.json"}],
+          "terminal": "complete"
+        }
+      }]
+    },
+    {
+      "name": "not-found",
+      "exchanges": [{
+        "label": "not-found",
+        "request": {"method": "GET", "target": "/fixture/not-found"},
+        "response": {
+          "status": 404,
+          "headers": [{"name": "Content-Type", "value": "application/json"}],
+          "chunks": [{"resource": ":/rumble/raw/http-error.json"}],
+          "terminal": "complete"
+        }
+      }]
+    },
+    {
+      "name": "server-error",
+      "exchanges": [{
+        "label": "server-error",
+        "request": {"method": "GET", "target": "/fixture/server-error"},
+        "response": {
+          "status": 503,
+          "headers": [
+            {"name": "Content-Type", "value": "application/json"},
+            {"name": "Retry-After", "value": "5"}
+          ],
+          "chunks": [{"resource": ":/rumble/raw/http-error.json"}],
+          "terminal": "complete"
+        }
+      }]
+    },
+    {
+      "name": "malformed-input",
+      "exchanges": [{
+        "label": "malformed-sse",
+        "request": {
+          "method": "GET",
+          "target": "/fixture/malformed",
+          "headers": [{"name": "Accept", "value": "text/event-stream"}]
+        },
+        "response": {
+          "status": 200,
+          "headers": [{"name": "Content-Type", "value": "text/event-stream"}],
+          "chunks": [{"resource": ":/rumble/raw/sse-malformed.txt"}],
+          "terminal": "complete"
+        }
+      }]
+    },
+    {
+      "name": "duplicate-input",
+      "exchanges": [{
+        "label": "duplicate-sse",
+        "request": {
+          "method": "GET",
+          "target": "/fixture/duplicate",
+          "headers": [{"name": "Accept", "value": "text/event-stream"}]
+        },
+        "response": {
+          "status": 200,
+          "headers": [{"name": "Content-Type", "value": "text/event-stream"}],
+          "chunks": [{"resource": ":/rumble/raw/sse-duplicate.txt"}],
+          "terminal": "complete"
+        }
+      }]
+    },
+    {
+      "name": "out-of-order-input",
+      "exchanges": [{
+        "label": "out-of-order-sse",
+        "request": {
+          "method": "GET",
+          "target": "/fixture/out-of-order",
+          "headers": [{"name": "Accept", "value": "text/event-stream"}]
+        },
+        "response": {
+          "status": 200,
+          "headers": [{"name": "Content-Type", "value": "text/event-stream"}],
+          "chunks": [{"resource": ":/rumble/raw/sse-out-of-order.txt"}],
+          "terminal": "complete"
+        }
+      }]
+    },
+    {
+      "name": "unknown-event",
+      "exchanges": [{
+        "label": "unknown-sse",
+        "request": {
+          "method": "GET",
+          "target": "/fixture/unknown",
+          "headers": [{"name": "Accept", "value": "text/event-stream"}]
+        },
+        "response": {
+          "status": 200,
+          "headers": [{"name": "Content-Type", "value": "text/event-stream"}],
+          "chunks": [{"resource": ":/rumble/raw/sse-unknown.txt"}],
+          "terminal": "complete"
+        }
+      }]
+    },
+    {
+      "name": "state-events",
+      "exchanges": [{
+        "label": "typed-state-events",
+        "request": {
+          "method": "GET",
+          "target": "/fixture/state-events",
+          "headers": [{"name": "Accept", "value": "text/event-stream"}]
+        },
+        "response": {
+          "status": 200,
+          "headers": [{"name": "Content-Type", "value": "text/event-stream"}],
+          "chunks": [{"resource": ":/rumble/raw/sse-state-events.txt"}],
+          "terminal": "complete"
+        }
+      }]
+    },
+    {
+      "name": "delayed-delivery",
+      "exchanges": [{
+        "label": "delayed-sse",
+        "request": {
+          "method": "GET",
+          "target": "/fixture/delayed",
+          "headers": [{"name": "Accept", "value": "text/event-stream"}]
+        },
+        "response": {
+          "status": 200,
+          "headers": [{"name": "Content-Type", "value": "text/event-stream"}],
+          "chunks": [{"resource": ":/rumble/raw/sse-delayed.txt", "after_ms": 250}],
+          "terminal": "complete",
+          "terminal_after_ms": 10
+        }
+      }]
+    },
+    {
+      "name": "stale-completion",
+      "exchanges": [
+        {
+          "label": "stale-old-request",
+          "request": {"method": "GET", "target": "/fixture/stale/old"},
+          "response": {
+            "status": 200,
+            "headers": [{"name": "Content-Type", "value": "text/event-stream"}],
+            "chunks": [{"resource": ":/rumble/raw/sse-delayed.txt", "after_ms": 100}],
+            "terminal": "complete"
+          }
+        },
+        {
+          "label": "stale-new-request",
+          "request": {"method": "GET", "target": "/fixture/stale/new"},
+          "response": {
+            "status": 200,
+            "headers": [{"name": "Content-Type", "value": "text/event-stream"}],
+            "chunks": [{"resource": ":/rumble/raw/sse-delayed.txt"}],
+            "terminal": "complete"
+          }
+        }
+      ]
+    },
+    {
+      "name": "cancellation",
+      "exchanges": [{
+        "label": "cancel-pending-stream",
+        "request": {"method": "GET", "target": "/fixture/cancel"},
+        "response": {
+          "status": 200,
+          "headers": [{"name": "Content-Type", "value": "text/event-stream"}],
+          "chunks": [{"resource": ":/rumble/raw/sse-delayed.txt", "after_ms": 500}],
+          "terminal": "disconnect",
+          "terminal_after_ms": 10,
+          "terminal_reason": "fixture cancellation fallback"
+        }
+      }]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+data: {"type":"delete_non_rant_messages","data":{"message_ids":["m1",9007199254740993],"clear":true}}
+
+data: {"type":"pin_message","data":{"message":{"id":"m_pin","user_id":"u_fixture","channel_id":"c_fixture","text":"fixture pinned","time":"2026-01-01T00:00:07+00:00","blocks":[]}}}
+
+: fixture end

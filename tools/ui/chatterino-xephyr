@@ -1,0 +1,2049 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage()
+{
+    cat <<'EOF'
+Usage: chatterino-ui-xephyr [--session NAME] COMMAND [OPTIONS]
+
+Run and control Chatterino in an authenticated Xephyr display.
+
+Commands:
+  doctor                    Check the host display and required programs.
+  start [OPTIONS]           Start Xephyr, Openbox, and Chatterino.
+  status                    Report process and nested-display state.
+  env                       Print shell exports for the nested display.
+  windows                   List visible windows in the nested display.
+  accounts-open             Open Settings > Accounts in the running session.
+  account-add-open          Open the shared Add Account dialog.
+  rumble-account-tab-open  Open Add Account > Rumble and prepare login.
+  rumble-open LOCATOR       Open a public Rumble channel in the active split.
+  rumble-status             Run /rumble-status and inspect fixed status fields.
+  rumble-login-open         Open the native Rumble login browser.
+  rumble-login-smoke        Launch/cancel login in the running session.
+  rumble-smoke LOCATOR      Open a Rumble channel, then inspect its status.
+  rumble-smoke-once LOCATOR [START OPTIONS]
+                            Start, smoke, and always stop an ephemeral session.
+  rumble-usercard-smoke     Check a synthetic Rumble usercard in the app.
+  rumble-usercard-smoke-once [START OPTIONS]
+                            Start, check the synthetic card, and always stop.
+  rumble-reply-smoke        Send a synthetic Rumble reply fallback in the app.
+  rumble-reply-smoke-once [START OPTIONS]
+                            Start, send the synthetic reply, and always stop.
+  rumble-lifecycle-smoke    Check synthetic live/end/restore state in the app.
+  rumble-lifecycle-smoke-once [START OPTIONS]
+                            Start, check lifecycle state, and always stop.
+  automatic-routing-smoke Check synthetic offline-first automatic routing.
+  automatic-routing-smoke-once [START OPTIONS]
+                            Start, check routing, and always stop.
+  compact-tab-reveal-smoke Check revealed tab/add/picker interaction.
+  compact-tab-reveal-smoke-once [START OPTIONS]
+                            Start, check compact reveal, and always stop.
+  control-tab-smoke         Exercise declarative plugin controls in the app.
+  control-tab-smoke-once [START OPTIONS]
+                            Start, check control tabs, and always stop.
+  rumble-login-smoke-once [START OPTIONS]
+                            Launch/cancel the login browser and verify cleanup.
+  rumble-login-live-once [START OPTIONS]
+                            Wait for a real login and verify the live session.
+  shot [NAME] [WINDOW]      Save a full PNG and an 800px WebP preview.
+  stop                      Stop this session without deleting its profile.
+
+Start options:
+  --chatterino PATH         Chatterino executable (default: packaged binary).
+  --rumble-login-helper PATH
+                            Use the legacy bounded test-protocol override.
+  --selenium-manager PATH  Selenium Manager executable for local app builds.
+  --qt-plugin-path PATH    Extra Qt plugins for an unwrapped local app build.
+  --qt-scale-factor 1|2    Force the tested application scale factor.
+  --rumble-usercard-fixture
+                            Inject the fixed offline usercard test message.
+  --rumble-reply-fixture    Prepare the fixed offline Rumble reply draft.
+  --rumble-lifecycle-fixture
+                            Drive fixed live/backoff/offline/restore states.
+  --automatic-routing-fixture
+                            Drive fixed offline/live automatic routing states.
+  --compact-tab-reveal-fixture
+                            Drive fixed revealed-tab interaction states.
+  --tab-emit-source PATH   Install tab-emit from this source directory.
+  --tab-emit-port PORT     Use an isolated tab-emit loopback port (default: 8765).
+  --control-tab-source PATH
+                            Install the generic control-tab demo and overflow fixtures.
+  --tab-position POSITION  Use top, left, right, or bottom notebook tabs.
+  --webdriver-library-path PATHS
+                            Nix library path for downloaded browser drivers.
+  --webdriver-loader PATH  Nix dynamic loader for downloaded browser drivers.
+  --display :N              Nested X display (default: first free :100..:199).
+  --geometry WIDTHxHEIGHT   Nested screen size (default: 1920x1080).
+  --profile PATH            Isolated profile root (default: session profile).
+  --plugins                 Load plugins; the default uses --safe-mode.
+
+WINDOW for shot is "main", "picker", "root", or a numeric X window ID.
+EOF
+}
+
+fail()
+{
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+note()
+{
+    printf '%s\n' "$*"
+}
+
+smoke_once_cleanup()
+{
+    local status=$?
+    trap - EXIT INT TERM HUP
+    rm -f "${session_dir}/rumble-login-status.png"
+    stop_session >/dev/null 2>&1 || true
+    exit "$status"
+}
+
+session="${CHATTERINO_UI_SESSION:-default}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --session)
+            [[ $# -ge 2 ]] || fail "--session requires a value"
+            session="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+[[ "$session" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+    fail "session names may contain only letters, numbers, dot, dash, and underscore"
+
+command_name="${1:-help}"
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+
+runtime_parent="${CHATTERINO_UI_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/chatterino-ui-xephyr-${UID}}"
+session_dir="${runtime_parent}/${session}"
+auth_file="${session_dir}/Xauthority"
+display_file="${session_dir}/display"
+main_window_file="${session_dir}/main-window"
+profile_file="${session_dir}/profile-path"
+tab_position_file="${session_dir}/tab-position"
+scale_file="${session_dir}/scale"
+artifacts_dir="${session_dir}/artifacts"
+shared_font_cache="${runtime_parent}/fontconfig-cache"
+shared_driver_cache="${runtime_parent}/browser-driver-cache"
+
+require_command()
+{
+    command -v "$1" >/dev/null 2>&1 || fail "required program is missing: $1"
+}
+
+require_session()
+{
+    [[ -r "$display_file" ]] ||
+        fail "session '${session}' is not started; run start first"
+    [[ -r "$auth_file" ]] ||
+        fail "session '${session}' has no X authority file"
+}
+
+read_display()
+{
+    require_session
+    local value
+    value="$(<"$display_file")"
+    [[ "$value" =~ ^:[0-9]+$ ]] || fail "session display state is invalid"
+    printf '%s' "$value"
+}
+
+inner()
+{
+    local nested_display
+    nested_display="$(read_display)"
+    env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+        DISPLAY="$nested_display" \
+        XAUTHORITY="$auth_file" \
+        QT_QPA_PLATFORM=xcb \
+        "$@"
+}
+
+display_ready()
+{
+    inner xdpyinfo >/dev/null 2>&1
+}
+
+read_pid()
+{
+    local role="$1"
+    local path="${session_dir}/${role}.pid"
+    [[ -r "$path" ]] || return 1
+    local pid
+    pid="$(<"$path")"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s' "$pid"
+}
+
+process_alive()
+{
+    local role="$1"
+    local pid
+    pid="$(read_pid "$role")" || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+window_exists()
+{
+    local id="$1"
+    inner xdotool getwindowgeometry "$id" >/dev/null 2>&1
+}
+
+first_window()
+{
+    local mode="$1"
+    local pattern="$2"
+    local ids
+    ids="$(inner xdotool search --onlyvisible "$mode" "$pattern" 2>/dev/null || true)"
+    [[ -n "$ids" ]] || return 1
+    printf '%s\n' "${ids%%$'\n'*}"
+}
+
+wait_for_window()
+{
+    local mode="$1"
+    local pattern="$2"
+    local attempts="${3:-200}"
+    local id
+    for ((i = 0; i < attempts; i++)); do
+        id="$(first_window "$mode" "$pattern" || true)"
+        if [[ -n "$id" ]]; then
+            printf '%s' "$id"
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
+main_window()
+{
+    local id=""
+    if [[ -r "$main_window_file" ]]; then
+        id="$(<"$main_window_file")"
+        if [[ "$id" =~ ^[0-9]+$ ]] && window_exists "$id"; then
+            printf '%s' "$id"
+            return 0
+        fi
+    fi
+
+    id="$(first_window --class '[Cc]hatterino' || true)"
+    if [[ -z "$id" ]]; then
+        id="$(first_window --name 'Chatterino' || true)"
+    fi
+    [[ -n "$id" ]] || return 1
+    printf '%s\n' "$id" >"$main_window_file"
+    printf '%s' "$id"
+}
+
+wait_for_main_window()
+{
+    local id
+    for ((i = 0; i < 3600; i++)); do
+        id="$(main_window || true)"
+        if [[ -n "$id" ]]; then
+            printf '%s' "$id"
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
+choose_display()
+{
+    local number
+    for ((number = 100; number <= 199; number++)); do
+        if [[ ! -e "/tmp/.X11-unix/X${number}" ]]; then
+            printf ':%d' "$number"
+            return 0
+        fi
+    done
+    return 1
+}
+
+stop_role()
+{
+    local role="$1"
+    local pid
+    pid="$(read_pid "$role" || true)"
+    [[ -n "$pid" ]] || return 0
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM -- "-${pid}" 2>/dev/null ||
+            kill -TERM "$pid" 2>/dev/null ||
+            true
+    fi
+}
+
+wait_role_stopped()
+{
+    local role="$1"
+    local pid
+    pid="$(read_pid "$role" || true)"
+    [[ -n "$pid" ]] || return 0
+
+    for ((i = 0; i < 50; i++)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.05
+    done
+
+    kill -KILL -- "-${pid}" 2>/dev/null ||
+        kill -KILL "$pid" 2>/dev/null ||
+        true
+}
+
+stop_session()
+{
+    if [[ ! -d "$session_dir" ]]; then
+        note "session=${session} state=stopped"
+        return 0
+    fi
+
+    stop_role chatterino
+    stop_role openbox
+    stop_role xephyr
+    wait_role_stopped chatterino
+    wait_role_stopped openbox
+    wait_role_stopped xephyr
+    rm -f \
+        "${session_dir}/chatterino.pid" \
+        "${session_dir}/openbox.pid" \
+        "${session_dir}/xephyr.pid" \
+        "$main_window_file" \
+        "$display_file"
+    note "session=${session} state=stopped profile-preserved=true"
+}
+
+doctor()
+{
+    local program
+    for program in Xephyr xauth xdpyinfo openbox xdotool import magick \
+        tesseract mcookie setsid; do
+        require_command "$program"
+    done
+
+    [[ -n "${DISPLAY:-}" ]] ||
+        fail "the outer host DISPLAY is unset; Xephyr needs the host Xwayland display"
+    xdpyinfo >/dev/null 2>&1 ||
+        fail "the outer host X display is not reachable"
+    note "host-display=reachable required-programs=available"
+}
+
+start_session()
+{
+    local chatterino_path=""
+    local nested_display=""
+    local geometry="1920x1080"
+    local profile=""
+    local rumble_login_helper=""
+    local selenium_manager="${CHATTERINO_SELENIUM_MANAGER:-}"
+    local qt_plugin_path=""
+    local qt_scale_factor=""
+    local webdriver_library_path=""
+    local webdriver_loader=""
+    local tab_emit_source=""
+    local tab_emit_port=8765
+    local control_tab_source=""
+    local tab_position="top"
+    local load_plugins=false
+    local rumble_usercard_fixture=false
+    local rumble_reply_fixture=false
+    local rumble_lifecycle_fixture=false
+    local automatic_routing_fixture=false
+    local compact_tab_reveal_fixture=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --chatterino)
+                [[ $# -ge 2 ]] || fail "--chatterino requires a path"
+                chatterino_path="$2"
+                shift 2
+                ;;
+            --display)
+                [[ $# -ge 2 ]] || fail "--display requires a value"
+                nested_display="$2"
+                shift 2
+                ;;
+            --rumble-login-helper)
+                [[ $# -ge 2 ]] ||
+                    fail "--rumble-login-helper requires a path"
+                rumble_login_helper="$2"
+                shift 2
+                ;;
+            --selenium-manager)
+                [[ $# -ge 2 ]] ||
+                    fail "--selenium-manager requires a path"
+                selenium_manager="$2"
+                shift 2
+                ;;
+            --qt-plugin-path)
+                [[ $# -ge 2 ]] ||
+                    fail "--qt-plugin-path requires a path"
+                qt_plugin_path="$2"
+                shift 2
+                ;;
+            --qt-scale-factor)
+                [[ $# -ge 2 ]] ||
+                    fail "--qt-scale-factor requires 1 or 2"
+                qt_scale_factor="$2"
+                shift 2
+                ;;
+            --rumble-usercard-fixture)
+                rumble_usercard_fixture=true
+                shift
+                ;;
+            --rumble-reply-fixture)
+                rumble_reply_fixture=true
+                shift
+                ;;
+            --rumble-lifecycle-fixture)
+                rumble_lifecycle_fixture=true
+                shift
+                ;;
+            --automatic-routing-fixture)
+                automatic_routing_fixture=true
+                shift
+                ;;
+            --compact-tab-reveal-fixture)
+                compact_tab_reveal_fixture=true
+                shift
+                ;;
+            --tab-emit-source)
+                [[ $# -ge 2 ]] ||
+                    fail "--tab-emit-source requires a path"
+                tab_emit_source="$2"
+                load_plugins=true
+                shift 2
+                ;;
+            --tab-emit-port)
+                [[ $# -ge 2 ]] ||
+                    fail "--tab-emit-port requires a value"
+                tab_emit_port="$2"
+                shift 2
+                ;;
+            --control-tab-source)
+                [[ $# -ge 2 ]] ||
+                    fail "--control-tab-source requires a path"
+                control_tab_source="$2"
+                load_plugins=true
+                shift 2
+                ;;
+            --tab-position)
+                [[ $# -ge 2 ]] ||
+                    fail "--tab-position requires top, left, right, or bottom"
+                tab_position="$2"
+                shift 2
+                ;;
+            --webdriver-library-path)
+                [[ $# -ge 2 ]] ||
+                    fail "--webdriver-library-path requires a value"
+                webdriver_library_path="$2"
+                shift 2
+                ;;
+            --webdriver-loader)
+                [[ $# -ge 2 ]] ||
+                    fail "--webdriver-loader requires a path"
+                webdriver_loader="$2"
+                shift 2
+                ;;
+            --geometry)
+                [[ $# -ge 2 ]] || fail "--geometry requires a value"
+                geometry="$2"
+                shift 2
+                ;;
+            --profile)
+                [[ $# -ge 2 ]] || fail "--profile requires a path"
+                profile="$2"
+                shift 2
+                ;;
+            --plugins)
+                load_plugins=true
+                shift
+                ;;
+            *)
+                fail "unknown start option: $1"
+                ;;
+        esac
+    done
+
+    doctor
+    [[ "$geometry" =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]] ||
+        fail "geometry must look like 1920x1080"
+    if [[ -n "$qt_scale_factor" &&
+          "$qt_scale_factor" != 1 && "$qt_scale_factor" != 2 ]]; then
+        fail "--qt-scale-factor must be 1 or 2"
+    fi
+    if [[ ! "$tab_emit_port" =~ ^[0-9]+$ ]] ||
+       ((tab_emit_port < 1 || tab_emit_port > 65535)); then
+        fail "--tab-emit-port must be from 1 through 65535"
+    fi
+    if [[ -n "$tab_emit_source" ]]; then
+        [[ -f "$tab_emit_source/init.lua" &&
+           -f "$tab_emit_source/info.json" ]] ||
+            fail "--tab-emit-source must contain init.lua and info.json"
+        tab_emit_source="$(readlink -f "$tab_emit_source")"
+    elif [[ "$tab_emit_port" != 8765 ]]; then
+        fail "--tab-emit-port requires --tab-emit-source"
+    fi
+    if [[ -n "$control_tab_source" ]]; then
+        [[ -f "$control_tab_source/init.lua" &&
+           -f "$control_tab_source/info.json" ]] ||
+            fail "--control-tab-source must contain init.lua and info.json"
+        control_tab_source="$(readlink -f "$control_tab_source")"
+    fi
+    case "$tab_position" in
+        top|left|right|bottom) ;;
+        *) fail "--tab-position requires top, left, right, or bottom" ;;
+    esac
+    if [[ -n "$nested_display" ]]; then
+        [[ "$nested_display" =~ ^:[0-9]+$ ]] ||
+            fail "display must look like :100"
+    else
+        nested_display="$(choose_display)" ||
+            fail "no free nested display was found from :100 through :199"
+    fi
+
+    if [[ -r "$display_file" ]] && display_ready; then
+        fail "session '${session}' is already running on $(<"$display_file")"
+    fi
+
+    if [[ -z "$chatterino_path" ]]; then
+        chatterino_path="${CHATTERINO_UI_DEFAULT_APP:-}"
+    fi
+    if [[ -z "$chatterino_path" ]]; then
+        chatterino_path="$(command -v chatterino || true)"
+    fi
+    [[ -n "$chatterino_path" && -x "$chatterino_path" ]] ||
+        fail "Chatterino is not executable; pass --chatterino PATH"
+    chatterino_path="$(readlink -f "$chatterino_path")"
+    local -a chatterino_env=(
+        "CHATTERINO_RUMBLE_LOGIN_TEST_X11=1"
+    )
+    if [[ -n "$qt_scale_factor" ]]; then
+        chatterino_env+=("QT_SCALE_FACTOR=${qt_scale_factor}")
+    fi
+    if [[ "$rumble_usercard_fixture" == true ]]; then
+        chatterino_env+=(
+            "CHATTERINO_UI_TEST_RUMBLE_USERCARD_FIXTURE=1"
+        )
+    fi
+    if [[ "$rumble_reply_fixture" == true ]]; then
+        chatterino_env+=(
+            "CHATTERINO_UI_TEST_RUMBLE_REPLY_FIXTURE=1"
+        )
+    fi
+    if [[ "$rumble_lifecycle_fixture" == true ]]; then
+        chatterino_env+=(
+            "CHATTERINO_UI_TEST_RUMBLE_LIFECYCLE_FIXTURE=1"
+        )
+    fi
+    if [[ "$automatic_routing_fixture" == true ]]; then
+        chatterino_env+=(
+            "CHATTERINO_UI_TEST_AUTOMATIC_ROUTING_FIXTURE=1"
+        )
+    fi
+    if [[ "$compact_tab_reveal_fixture" == true ]]; then
+        chatterino_env+=(
+            "CHATTERINO_UI_TEST_COMPACT_TAB_REVEAL_FIXTURE=1"
+        )
+    fi
+    if [[ -n "$rumble_login_helper" ]]; then
+        [[ -x "$rumble_login_helper" ]] ||
+            fail "Rumble login test override is not executable: ${rumble_login_helper}"
+        rumble_login_helper="$(readlink -f "$rumble_login_helper")"
+        chatterino_env+=(
+            "CHATTERINO_RUMBLE_LOGIN_HELPER=${rumble_login_helper}"
+        )
+    fi
+    if [[ -n "$selenium_manager" ]]; then
+        [[ -x "$selenium_manager" ]] ||
+            fail "Selenium Manager is not executable: ${selenium_manager}"
+        selenium_manager="$(readlink -f "$selenium_manager")"
+        chatterino_env+=(
+            "CHATTERINO_SELENIUM_MANAGER=${selenium_manager}"
+        )
+    fi
+    if [[ -n "$qt_plugin_path" ]]; then
+        [[ -d "$qt_plugin_path" ]] ||
+            fail "Qt plugin path is not a directory: ${qt_plugin_path}"
+        qt_plugin_path="$(readlink -f "$qt_plugin_path")"
+        chatterino_env+=(
+            "QT_PLUGIN_PATH=${qt_plugin_path}"
+        )
+    fi
+    if [[ -n "$webdriver_library_path" ]]; then
+        chatterino_env+=(
+            "CHATTERINO_WEBDRIVER_LIBRARY_PATH=${webdriver_library_path}"
+        )
+    fi
+    if [[ -n "$webdriver_loader" ]]; then
+        [[ -x "$webdriver_loader" ]] ||
+            fail "WebDriver loader is not executable: ${webdriver_loader}"
+        webdriver_loader="$(readlink -f "$webdriver_loader")"
+        chatterino_env+=(
+            "CHATTERINO_WEBDRIVER_LOADER=${webdriver_loader}"
+        )
+    fi
+
+    umask 077
+    mkdir -p "$session_dir" "$artifacts_dir" "$shared_font_cache" \
+        "$shared_driver_cache"
+    chmod 700 "$runtime_parent" "$session_dir"
+    if [[ -z "$profile" ]]; then
+        profile="${session_dir}/profile"
+    fi
+    mkdir -p \
+        "$profile/home" \
+        "$profile/config" \
+        "$profile/data" \
+        "$profile/cache" \
+        "$profile/cache/chatterino" \
+        "$profile/state"
+    if [[ ! -e "$profile/cache/fontconfig" &&
+          ! -L "$profile/cache/fontconfig" ]]; then
+        ln -s "$shared_font_cache" "$profile/cache/fontconfig"
+    fi
+    if [[ ! -e "$profile/cache/chatterino/browser-drivers" &&
+          ! -L "$profile/cache/chatterino/browser-drivers" ]]; then
+        ln -s "$shared_driver_cache" \
+            "$profile/cache/chatterino/browser-drivers"
+    fi
+    profile="$(readlink -f "$profile")"
+    local settings_path="${profile}/data/chatterino/Settings/settings.json"
+    local settings_tmp="${settings_path}.ui-harness.tmp"
+
+    if [[ -n "$tab_emit_source" ]]; then
+        local tab_emit_target="${profile}/data/chatterino/Plugins/tab-emit"
+        install -Dm644 "$tab_emit_source/init.lua" \
+            "$tab_emit_target/init.lua"
+        install -Dm644 "$tab_emit_source/info.json" \
+            "$tab_emit_target/info.json"
+        sed -i \
+            "s|^local WS_URL = .*$|local WS_URL = \"ws://127.0.0.1:${tab_emit_port}\"|" \
+            "$tab_emit_target/init.lua"
+        grep -Fx \
+            "local WS_URL = \"ws://127.0.0.1:${tab_emit_port}\"" \
+            "$tab_emit_target/init.lua" >/dev/null ||
+            fail "could not configure the isolated tab-emit endpoint"
+        mkdir -p "$(dirname "$settings_path")"
+        if [[ -f "$settings_path" ]]; then
+            jq '
+                .plugins.supportEnabled = true
+                | .plugins.enabledPlugins = ["tab-emit"]
+            ' "$settings_path" >"$settings_tmp"
+        else
+            jq -n '{
+                plugins: {
+                    supportEnabled: true,
+                    enabledPlugins: ["tab-emit"]
+                }
+            }' >"$settings_tmp"
+        fi
+        mv "$settings_tmp" "$settings_path"
+    fi
+
+    if [[ -n "$control_tab_source" ]]; then
+        local control_tab_target id index
+        local control_tab_ids='[
+            "control-tab-demo",
+            "control-tab-fixture-01", "control-tab-fixture-02",
+            "control-tab-fixture-03", "control-tab-fixture-04",
+            "control-tab-fixture-05", "control-tab-fixture-06",
+            "control-tab-fixture-07", "control-tab-fixture-08",
+            "control-tab-fixture-09", "control-tab-fixture-10",
+            "control-tab-fixture-11"
+        ]'
+        control_tab_target="${profile}/data/chatterino/Plugins/control-tab-demo"
+        install -Dm644 "$control_tab_source/init.lua" \
+            "$control_tab_target/init.lua"
+        install -Dm644 "$control_tab_source/info.json" \
+            "$control_tab_target/info.json"
+        for index in {01..11}; do
+            id="control-tab-fixture-${index}"
+            control_tab_target="${profile}/data/chatterino/Plugins/${id}"
+            install -Dm644 "$control_tab_source/init.lua" \
+                "$control_tab_target/init.lua"
+            mkdir -p "$control_tab_target"
+            jq --arg name "Control Fixture ${index}" \
+                '.name = $name' "$control_tab_source/info.json" \
+                >"$control_tab_target/info.json"
+        done
+        mkdir -p "$(dirname "$settings_path")"
+        if [[ -f "$settings_path" ]]; then
+            jq --argjson ids "$control_tab_ids" '
+                .plugins.supportEnabled = true
+                | .plugins.enabledPlugins =
+                    (((.plugins.enabledPlugins // []) + $ids) | unique)
+            ' "$settings_path" >"$settings_tmp"
+        else
+            jq -n --argjson ids "$control_tab_ids" '{
+                plugins: {
+                    supportEnabled: true,
+                    enabledPlugins: $ids
+                }
+            }' >"$settings_tmp"
+        fi
+        mv "$settings_tmp" "$settings_path"
+    fi
+
+    local tab_position_value=0
+    case "$tab_position" in
+        left) tab_position_value=1 ;;
+        right) tab_position_value=2 ;;
+        bottom) tab_position_value=3 ;;
+    esac
+    mkdir -p "$(dirname "$settings_path")"
+    if [[ -f "$settings_path" ]]; then
+        jq --argjson position "$tab_position_value" \
+            '.appearance.tabDirection = $position' \
+            "$settings_path" >"$settings_tmp"
+    else
+        jq -n --argjson position "$tab_position_value" \
+            '{appearance: {tabDirection: $position}}' >"$settings_tmp"
+    fi
+    mv "$settings_tmp" "$settings_path"
+
+    : >"$auth_file"
+    chmod 600 "$auth_file"
+    local cookie
+    cookie="$(mcookie)"
+    xauth -f "$auth_file" add "$nested_display" MIT-MAGIC-COOKIE-1 "$cookie"
+    unset cookie
+
+    printf '%s\n' "$nested_display" >"$display_file"
+    printf '%s\n' "$profile" >"$profile_file"
+    printf '%s\n' "$tab_position" >"$tab_position_file"
+    printf '%s\n' "${qt_scale_factor:-1}" >"$scale_file"
+
+    setsid Xephyr "$nested_display" \
+        -screen "$geometry" \
+        -auth "$auth_file" \
+        -nolisten tcp \
+        -noreset \
+        -br \
+        -name "Chatterino UI Test (${session})" \
+        >>"${session_dir}/xephyr.log" 2>&1 </dev/null &
+    printf '%s\n' "$!" >"${session_dir}/xephyr.pid"
+
+    local ready=false
+    for ((i = 0; i < 200; i++)); do
+        if display_ready; then
+            ready=true
+            break
+        fi
+        if ! process_alive xephyr; then
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ "$ready" != true ]]; then
+        stop_session >/dev/null
+        fail "Xephyr did not start; inspect ${session_dir}/xephyr.log"
+    fi
+
+    setsid env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+        DISPLAY="$nested_display" \
+        XAUTHORITY="$auth_file" \
+        HOME="$profile/home" \
+        XDG_CONFIG_HOME="$profile/config" \
+        XDG_DATA_HOME="$profile/data" \
+        XDG_CACHE_HOME="$profile/cache" \
+        XDG_STATE_HOME="$profile/state" \
+        openbox --sm-disable \
+        >>"${session_dir}/openbox.log" 2>&1 </dev/null &
+    printf '%s\n' "$!" >"${session_dir}/openbox.pid"
+
+    # Let the window manager claim the root window before the first Qt window
+    # is mapped. Starting both clients in the same scheduler tick can otherwise
+    # leave a fresh profile running without a managed main window.
+    sleep 0.25
+    if ! process_alive openbox; then
+        stop_session >/dev/null
+        fail "Openbox stopped during startup; inspect ${session_dir}/openbox.log"
+    fi
+
+    local -a chatterino_args=(--verbose)
+    if [[ "$load_plugins" != true ]]; then
+        chatterino_args+=(--safe-mode)
+    fi
+
+    setsid env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+        DISPLAY="$nested_display" \
+        XAUTHORITY="$auth_file" \
+        QT_QPA_PLATFORM=xcb \
+        HOME="$profile/home" \
+        XDG_CONFIG_HOME="$profile/config" \
+        XDG_DATA_HOME="$profile/data" \
+        XDG_CACHE_HOME="$profile/cache" \
+        XDG_STATE_HOME="$profile/state" \
+        "${chatterino_env[@]}" \
+        "$chatterino_path" "${chatterino_args[@]}" \
+        >>"${session_dir}/chatterino.log" 2>&1 </dev/null &
+    printf '%s\n' "$!" >"${session_dir}/chatterino.pid"
+
+    local main
+    main="$(wait_for_main_window || true)"
+    if [[ -z "$main" ]]; then
+        stop_session >/dev/null
+        fail "Chatterino did not create a window; inspect ${session_dir}/chatterino.log"
+    fi
+    printf '%s\n' "$main" >"$main_window_file"
+    inner xdotool windowactivate --sync "$main" 2>/dev/null
+    local screen_width screen_height window_width window_height
+    read -r screen_width screen_height < <(inner xdotool getdisplaygeometry)
+    [[ "$screen_width" =~ ^[0-9]+$ && "$screen_height" =~ ^[0-9]+$ ]] ||
+        fail "could not read the nested screen geometry"
+    window_width=$((screen_width - 4))
+    window_height=$((screen_height - 24))
+    inner xdotool windowsize --sync "$main" "$window_width" "$window_height"
+    inner xdotool windowmove --sync "$main" 2 18
+    sleep 0.15
+
+    note "session=${session} state=running display=${nested_display} main-window=${main}"
+    note "profile=${profile}"
+    note "artifacts=${artifacts_dir}"
+}
+
+session_status()
+{
+    if [[ ! -r "$display_file" ]]; then
+        note "session=${session} state=stopped"
+        return 1
+    fi
+
+    local nested_display
+    nested_display="$(<"$display_file")"
+    local display_state=unreachable
+    if display_ready; then
+        display_state=reachable
+    fi
+
+    local main=none
+    main="$(main_window || true)"
+    [[ -n "$main" ]] || main=none
+    note "session=${session} display=${nested_display} display-state=${display_state} main-window=${main}"
+    local role state
+    for role in xephyr openbox chatterino; do
+        state=stopped
+        if process_alive "$role"; then
+            state=running
+        fi
+        note "${role}=${state}"
+    done
+    [[ "$display_state" == reachable && "$main" != none ]]
+}
+
+print_env()
+{
+    local nested_display
+    nested_display="$(read_display)"
+    printf 'export DISPLAY=%q\n' "$nested_display"
+    printf 'export XAUTHORITY=%q\n' "$auth_file"
+    printf 'export QT_QPA_PLATFORM=xcb\n'
+    printf 'unset WAYLAND_DISPLAY WAYLAND_SOCKET\n'
+}
+
+list_windows()
+{
+    require_session
+    local ids
+    ids="$(inner xdotool search --onlyvisible --name '.*' 2>/dev/null || true)"
+    [[ -n "$ids" ]] || fail "no visible windows were found"
+
+    local id title geometry width height x y
+    while IFS= read -r id; do
+        [[ "$id" =~ ^[0-9]+$ ]] || continue
+        title="$(inner xdotool getwindowname "$id" 2>/dev/null || true)"
+        title="${title//$'\n'/ }"
+        [[ -n "$title" ]] || continue
+        geometry="$(inner xdotool getwindowgeometry --shell "$id" 2>/dev/null || true)"
+        width=unknown
+        height=unknown
+        x=unknown
+        y=unknown
+        while IFS='=' read -r key value; do
+            case "$key" in
+                WIDTH) width="$value" ;;
+                HEIGHT) height="$value" ;;
+                X) x="$value" ;;
+                Y) y="$value" ;;
+            esac
+        done <<<"$geometry"
+        printf 'id=%s x=%s y=%s width=%s height=%s title=%q\n' \
+            "$id" "$x" "$y" "$width" "$height" "$title"
+    done <<<"$ids"
+}
+
+shot_window()
+{
+    local name="$1"
+    local target="$2"
+    [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+        fail "shot names may contain only letters, numbers, dot, dash, and underscore"
+
+    local id
+    case "$target" in
+        main)
+            id="$(main_window || true)"
+            [[ -n "$id" ]] || fail "the Chatterino main window was not found"
+            ;;
+        picker)
+            id="$(first_window --name '^Open channel$' || true)"
+            [[ -n "$id" ]] || fail "the channel picker was not found"
+            ;;
+        root)
+            id=root
+            ;;
+        *)
+            [[ "$target" =~ ^[0-9]+$ ]] || fail "invalid window target: $target"
+            id="$target"
+            window_exists "$id" || fail "window does not exist: $id"
+            ;;
+    esac
+
+    mkdir -p "$artifacts_dir"
+    local stamp full preview
+    stamp="$(date +%Y%m%d-%H%M%S-%3N)"
+    full="${artifacts_dir}/${stamp}-${name}.png"
+    preview="${artifacts_dir}/${stamp}-${name}.webp"
+    inner import -silent -window "$id" "$full"
+    magick "$full" -resize '800x800>' -strip -quality 78 "$preview"
+    LAST_FULL="$full"
+    LAST_PREVIEW="$preview"
+}
+
+take_shot()
+{
+    local name="${1:-manual}"
+    local target="${2:-main}"
+    shot_window "$name" "$target"
+    note "full=${LAST_FULL}"
+    note "preview=${LAST_PREVIEW}"
+}
+
+rumble_open()
+{
+    [[ $# -eq 1 ]] || fail "rumble-open requires exactly one public locator"
+    local locator="$1"
+    [[ ${#locator} -le 2048 ]] || fail "Rumble locator is too long"
+    # POSIX argument strings cannot contain NUL; reject the remaining line
+    # controls before sending the locator to xdotool.
+    [[ "$locator" != *$'\n'* && "$locator" != *$'\r'* ]] ||
+        fail "Rumble locator contains a control character"
+
+    local main picker
+    main="$(main_window || true)"
+    [[ -n "$main" ]] || fail "the Chatterino main window was not found"
+    inner xdotool windowactivate --sync "$main" 2>/dev/null
+    inner xdotool keyup Control_L 2>/dev/null || true
+    inner xdotool keyup Control_R 2>/dev/null || true
+    inner xdotool key --clearmodifiers ctrl+t
+    inner xdotool keyup Control_L 2>/dev/null || true
+    inner xdotool keyup Control_R 2>/dev/null || true
+
+    picker="$(wait_for_window --name '^Open channel$' 200 || true)"
+    if [[ -z "$picker" ]]; then
+        fail "the channel picker did not open"
+    fi
+
+    # The picker has fixed tab geometry at the harness's fixed scale. Clicking
+    # the Rumble tab also focuses its locator field.
+    # Keep field focus, selection, modifier release, and typing in one xdotool
+    # process. Splitting these operations can leave XTEST's Control state
+    # visible to the next process, turning a leading T into Ctrl+T.
+    inner xdotool \
+        windowactivate --sync "$picker" \
+        mousemove --sync --window "$picker" 370 40 \
+        click 1 \
+        sleep 0.1 \
+        mousemove --sync --window "$picker" 300 200 \
+        click 1 \
+        key ctrl+a \
+        keyup ctrl \
+        sleep 0.1 \
+        type --clearmodifiers --delay 5 "$locator"
+    inner xdotool key --clearmodifiers Return
+
+    local accepted=false
+    for ((i = 0; i < 600; i++)); do
+        if ! window_exists "$picker"; then
+            accepted=true
+            break
+        fi
+        sleep 0.05
+    done
+
+    if [[ "$accepted" != true ]]; then
+        shot_window rumble-open-failure "$picker"
+        local ocr lower diagnostic=unknown
+        ocr="$(tesseract "$LAST_FULL" stdout --psm 6 2>/dev/null || true)"
+        lower="${ocr,,}"
+        local candidate
+        for candidate in header_limit http_failure redirect_rejected \
+            embed_schema; do
+            if [[ "$lower" == *"$candidate"* ]]; then
+                diagnostic="$candidate"
+                break
+            fi
+        done
+        if [[ "$diagnostic" == unknown &&
+              "$lower" == *"safety limit"* ]]; then
+            diagnostic=safety-limit
+        elif [[ "$diagnostic" == unknown &&
+                ( "$lower" == *"could not"* ||
+                  "$lower" == *"error"* ) ]]; then
+            diagnostic=visible-error
+        fi
+        note "rumble-open=rejected diagnostic=${diagnostic}"
+        note "preview=${LAST_PREVIEW}"
+        return 1
+    fi
+
+    inner xdotool windowactivate --sync "$main" 2>/dev/null
+    note "rumble-open=accepted"
+}
+
+read_window_size()
+{
+    local id="$1"
+    local geometry key value
+    geometry="$(inner xdotool getwindowgeometry --shell "$id")"
+    WINDOW_WIDTH=""
+    WINDOW_HEIGHT=""
+    while IFS='=' read -r key value; do
+        case "$key" in
+            WIDTH) WINDOW_WIDTH="$value" ;;
+            HEIGHT) WINDOW_HEIGHT="$value" ;;
+        esac
+    done <<<"$geometry"
+    [[ "$WINDOW_WIDTH" =~ ^[0-9]+$ && "$WINDOW_HEIGHT" =~ ^[0-9]+$ ]]
+}
+
+rumble_status()
+{
+    local main
+    main="$(main_window || true)"
+    [[ -n "$main" ]] || fail "the Chatterino main window was not found"
+    read_window_size "$main" || fail "could not read the Chatterino window size"
+
+    local input_x=$((WINDOW_WIDTH / 2))
+    local input_y=$((WINDOW_HEIGHT - 35))
+    inner xdotool windowactivate --sync "$main" 2>/dev/null
+    inner xdotool mousemove --sync --window "$main" "$input_x" "$input_y"
+    inner xdotool click --window "$main" 1
+    inner xdotool key --window "$main" --clearmodifiers ctrl+a
+    inner xdotool type --window "$main" --clearmodifiers --delay 1 /rumble-status
+    inner xdotool key --window "$main" --clearmodifiers Return
+    sleep 0.75
+
+    shot_window rumble-status "$main"
+    local ocr lower provider=unknown lifecycle=unreadable candidate
+    ocr="$(tesseract "$LAST_FULL" stdout --psm 6 2>/dev/null || true)"
+    lower="${ocr,,}"
+    if [[ "$lower" =~ provider:[[:space:]]*rumble ]]; then
+        provider=rumble
+    fi
+    for candidate in offline connecting connected backoff rate-limited error stopped; do
+        if [[ "$lower" =~ state:[[:space:]]*${candidate} ]]; then
+            lifecycle="$candidate"
+            break
+        fi
+    done
+
+    note "provider=${provider} state=${lifecycle}"
+    note "preview=${LAST_PREVIEW}"
+    [[ "$provider" == rumble && "$lifecycle" != unreadable ]]
+}
+
+rumble_smoke()
+{
+    [[ $# -eq 1 ]] || fail "rumble-smoke requires exactly one public locator"
+    rumble_open "$1"
+    sleep 2
+    shot_window rumble-chat main
+    note "chat-preview=${LAST_PREVIEW}"
+    rumble_status
+}
+
+rumble_smoke_once()
+{
+    [[ $# -ge 1 ]] ||
+        fail "rumble-smoke-once requires a public locator"
+    local locator="$1"
+    shift
+    trap smoke_once_cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    start_session "$@"
+    rumble_smoke "$locator"
+    stop_session
+    trap - EXIT INT TERM HUP
+}
+
+rumble_usercard_smoke()
+{
+    local main
+    main="$(main_window || true)"
+    [[ -n "$main" ]] || fail "the Chatterino main window was not found"
+    sleep 0.75
+
+    shot_window rumble-usercard-fixture "$main"
+    local coordinates text_x text_y text_width text_height click_x click_y
+    coordinates="$(
+        tesseract "$LAST_FULL" stdout --psm 6 tsv 2>/dev/null |
+            awk -F '\t' '
+                tolower($12) ~ /^synthetic/ {
+                    print $7, $8, $9, $10,
+                          int($7 + ($9 / 2)), int($8 + ($10 / 2));
+                    exit
+                }'
+    )"
+    read -r text_x text_y text_width text_height click_x click_y <<<"$coordinates"
+    [[ "$text_x" =~ ^[0-9]+$ && "$text_y" =~ ^[0-9]+$ &&
+       "$text_width" =~ ^[1-9][0-9]*$ &&
+       "$text_height" =~ ^[1-9][0-9]*$ &&
+       "$click_x" =~ ^[0-9]+$ && "$click_y" =~ ^[0-9]+$ ]] ||
+        fail "the synthetic Rumble author was not rendered"
+
+    local color_means mean_green mean_blue username_paint=foreign
+    color_means="$(
+        magick "$LAST_FULL" \
+            -crop "${text_width}x${text_height}+${text_x}+${text_y}" \
+            -colorspace RGB \
+            -format '%[fx:mean.g] %[fx:mean.b]' info:
+    )"
+    read -r mean_green mean_blue <<<"$color_means"
+    if awk -v green="$mean_green" -v blue="$mean_blue" \
+        'BEGIN { exit !(green > blue) }'; then
+        username_paint=rumble-native
+    fi
+
+    inner xdotool mousemove --sync --window "$main" "$click_x" "$click_y"
+    inner xdotool click --window "$main" 1
+
+    local popup
+    popup="$(wait_for_window --name '^Synthetic Rumble.*Usercard' 200 || true)"
+    [[ -n "$popup" ]] || fail "the synthetic Rumble usercard did not open"
+    sleep 0.2
+    shot_window rumble-usercard "$popup"
+
+    local ocr lower fields=missing foreign_controls=present
+    ocr="$(tesseract "$LAST_FULL" stdout --psm 6 2>/dev/null || true)"
+    lower="${ocr,,}"
+    if [[ "$lower" == *"rumble"* &&
+          "$lower" == *"synthetic rumble"* &&
+          "$lower" == *"synthetic-rumble"* &&
+          "$lower" == *"roles: moderator"* &&
+          "$lower" == *"badges: verified"* &&
+          "$lower" == *"recurring subscription"* ]]; then
+        fields=exact
+    fi
+    if [[ "$lower" != *"followers:"* &&
+          "$lower" != *"created:"* &&
+          "$lower" != *"pronouns:"* &&
+          "$lower" != *"ignore highlights"* &&
+          "$lower" != *"add notes"* &&
+          "$lower" != *"timeouts"* &&
+          "$lower" != *"open 7tv"* &&
+          "$lower" != *"twitch.tv"* &&
+          "$lower" != *"kick.com"* ]]; then
+        foreign_controls=absent
+    fi
+
+    note "rumble-usercard=opened fields=${fields} foreign-controls=${foreign_controls} username-paint=${username_paint}"
+    [[ "$fields" == exact && "$foreign_controls" == absent &&
+       "$username_paint" == rumble-native ]]
+}
+
+rumble_usercard_smoke_once()
+{
+    trap smoke_once_cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    start_session --rumble-usercard-fixture "$@"
+    rumble_usercard_smoke
+    stop_session
+    trap - EXIT INT TERM HUP
+}
+
+rumble_reply_smoke()
+{
+    local main
+    main="$(main_window || true)"
+    [[ -n "$main" ]] || fail "the Chatterino main window was not found"
+    sleep 0.75
+
+    read_window_size "$main" || fail "could not read the Chatterino window size"
+    local input_x=$((WINDOW_WIDTH / 2))
+    local input_y=$((WINDOW_HEIGHT - 35))
+    inner xdotool windowactivate --sync "$main" 2>/dev/null
+    inner xdotool mousemove --sync --window "$main" "$input_x" "$input_y"
+    inner xdotool click --window "$main" 1
+    inner xdotool key --window "$main" --clearmodifiers Return
+    sleep 0.5
+
+    shot_window rumble-reply-result "$main"
+    local ocr lower result=failed
+    ocr="$(tesseract "$LAST_FULL" stdout --psm 6 2>/dev/null || true)"
+    lower="${ocr,,}"
+    if [[ "$lower" == *"rumble fallback sends 1 exact yes input empty yes"* &&
+          "$lower" != *"rumble replies are not supported"* &&
+          "$lower" != *"replying to"* ]]; then
+        result=passed
+    fi
+
+    note "rumble-reply-fallback=${result} dispatches=one text=exact input=empty"
+    note "preview=${LAST_PREVIEW}"
+    [[ "$result" == passed ]]
+}
+
+rumble_reply_smoke_once()
+{
+    trap smoke_once_cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    start_session --rumble-reply-fixture "$@"
+    rumble_reply_smoke
+    stop_session
+    trap - EXIT INT TERM HUP
+}
+
+rumble_lifecycle_smoke()
+{
+    local main
+    main="$(main_window || true)"
+    [[ -n "$main" ]] || fail "the Chatterino main window was not found"
+    sleep 1
+
+    shot_window rumble-lifecycle-result "$main"
+    local ocr lower result=failed
+    ocr="$(tesseract "$LAST_FULL" stdout --psm 6 2>/dev/null || true)"
+    lower="${ocr,,}"
+    if [[ "$lower" == *"rumble lifecycle"* &&
+          "$lower" == *"live yes"* &&
+          "$lower" == *"backoff yes"* &&
+          "$lower" == *"offline yes"* &&
+          "$lower" == *"restored yes"* &&
+          "$lower" == *"draft yes"* &&
+          "$lower" == *"identity yes"* &&
+          "$lower" == *"titles yes"* &&
+          "$lower" == *"tabstable yes"* &&
+          "$lower" == *"transitions yes"* ]]; then
+        result=passed
+    fi
+
+    note "rumble-lifecycle=${result} live=online backoff=retained offline=confirmed restored=online draft=preserved identity=stable titles=updated-and-cleared tab=stable"
+    note "preview=${LAST_PREVIEW}"
+    [[ "$result" == passed ]]
+}
+
+rumble_lifecycle_smoke_once()
+{
+    trap smoke_once_cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    start_session --rumble-lifecycle-fixture "$@"
+    rumble_lifecycle_smoke
+    stop_session
+    trap - EXIT INT TERM HUP
+}
+
+automatic_routing_smoke()
+{
+    local main
+    main="$(main_window || true)"
+    [[ -n "$main" ]] || fail "the Chatterino main window was not found"
+    sleep 2
+
+    shot_window automatic-routing-result "$main"
+    local title lower result=failed
+    title="$(inner xdotool getwindowname "$main" 2>/dev/null || true)"
+    lower="${title,,}"
+    if [[ "$lower" == *"automatic-routing"* &&
+          "$lower" == *"offline=yes"* &&
+          "$lower" == *"first-send=yes"* &&
+          "$lower" == *"first-draft=yes"* &&
+          "$lower" == *"restored=yes"* &&
+          "$lower" == *"second-send=yes"* &&
+          "$lower" == *"second-draft=yes"* &&
+          "$lower" == *"layout=yes"* &&
+          "$lower" == *"notice-absent=yes"* &&
+          "$lower" == *"glyph=yes"* ]]; then
+        result=passed
+    fi
+
+    note "automatic-routing=${result} offline=fallback first-send=once restored=primary second-send=once drafts=preserved layout=stable notice=absent glyph=visible"
+    note "preview=${LAST_PREVIEW}"
+    [[ "$result" == passed ]]
+}
+
+automatic_routing_smoke_once()
+{
+    trap smoke_once_cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    start_session --automatic-routing-fixture "$@"
+    automatic_routing_smoke
+    stop_session
+    trap - EXIT INT TERM HUP
+}
+
+compact_tab_reveal_smoke()
+{
+    local main
+    main="$(main_window || true)"
+    [[ -n "$main" ]] || fail "the Chatterino main window was not found"
+    sleep 2
+
+    shot_window compact-tab-reveal-result "$main"
+    local title lower result=failed
+    title="$(inner xdotool getwindowname "$main" 2>/dev/null || true)"
+    lower="${title,,}"
+    if [[ "$lower" == *"compact-reveal"* &&
+          "$lower" == *"tab=yes"* &&
+          "$lower" == *"add=yes"* &&
+          "$lower" == *"picker-open=yes"* &&
+          "$lower" == *"picker-closed=yes"* &&
+          "$lower" == *"empty=yes"* &&
+          "$lower" == *"outside=yes"* &&
+          "$lower" == *"accessible=yes"* ]]; then
+        result=passed
+    fi
+
+    note "compact-tab-reveal=${result} tab=retained add=once picker=open-and-closed empty=isolated outside=dismissed accessible=preserved"
+    note "preview=${LAST_PREVIEW}"
+    [[ "$result" == passed ]]
+}
+
+compact_tab_reveal_smoke_once()
+{
+    trap smoke_once_cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    start_session --compact-tab-reveal-fixture "$@"
+    compact_tab_reveal_smoke
+    stop_session
+    trap - EXIT INT TERM HUP
+}
+
+ocr_snapshot()
+{
+    local target="$1"
+    local name="$2"
+    shot_window "$name" "$target"
+    # Control tabs are a sparse strip around a much larger chat surface. Treat
+    # the screenshot as sparse text so labels at opposite edges do not get
+    # merged into one artificial text block.
+    OCR_TEXT="$(tesseract "$LAST_FULL" stdout --psm 11 2>/dev/null || true)"
+    OCR_LOWER="${OCR_TEXT,,}"
+}
+
+click_ocr_word()
+{
+    local target="$1"
+    local pattern="$2"
+    local name="$3"
+    local coordinates click_x click_y
+    shot_window "$name" "$target"
+    coordinates="$(
+        tesseract "$LAST_FULL" stdout --psm 11 tsv 2>/dev/null |
+            awk -F '\t' -v pattern="$pattern" '
+                tolower($12) ~ pattern {
+                    print int($7 + ($9 / 2)), int($8 + ($10 / 2));
+                    exit
+                }'
+    )"
+    read -r click_x click_y <<<"$coordinates"
+    [[ "$click_x" =~ ^[0-9]+$ && "$click_y" =~ ^[0-9]+$ ]] ||
+        fail "could not locate the fixed UI word matching ${pattern}"
+    inner xdotool windowactivate --sync "$target" 2>/dev/null
+    inner xdotool mousemove --sync --window "$target" "$click_x" "$click_y"
+    inner xdotool click --window "$target" 1
+}
+
+click_first_control_tab()
+{
+    local target="$1"
+    local tested_scale=1
+    [[ -r "$scale_file" ]] && tested_scale="$(<"$scale_file")"
+    inner xdotool windowactivate --sync "$target" 2>/dev/null
+    inner xdotool mousemove --sync --window "$target" \
+        $((150 * tested_scale)) $((32 * tested_scale))
+    inner xdotool click --window "$target" 1
+}
+
+control_tab_smoke()
+{
+    local main popup="" ids candidate
+    main="$(main_window || true)"
+    [[ -n "$main" ]] || fail "the Chatterino main window was not found"
+    sleep 0.5
+
+    # Plugin discovery is asynchronous. Wait for the expected overflow affordance
+    # instead of racing a partially loaded row. Its native dark button needs a
+    # tight high-contrast crop for reliable OCR.
+    local tested_scale=1 overflow_ready=false crop_width crop_height crop_x
+    local overflow_image="${session_dir}/control-tab-overflow.png"
+    [[ -r "$scale_file" ]] && tested_scale="$(<"$scale_file")"
+    read_window_size "$main" || fail "could not read the Chatterino window size"
+    crop_width=$((190 * tested_scale))
+    crop_height=$((64 * tested_scale))
+    crop_x=$((WINDOW_WIDTH - crop_width))
+    for ((i = 0; i < 80; i++)); do
+        shot_window control-tab-initial "$main"
+        magick "$LAST_FULL" \
+            -crop "${crop_width}x${crop_height}+${crop_x}+0" \
+            -resize 400% -colorspace Gray -threshold 50% -negate \
+            "$overflow_image"
+        OCR_TEXT="$(tesseract "$overflow_image" stdout --psm 7 \
+            2>/dev/null || true)"
+        if [[ "${OCR_TEXT,,}" == *"more"* ]]; then
+            overflow_ready=true
+            break
+        fi
+        sleep 0.05
+    done
+    rm -f "$overflow_image"
+    [[ "$overflow_ready" == true ]] ||
+        fail "the plugin control-tab overflow was not rendered"
+    OCR_TEXT="$(tesseract "$LAST_FULL" stdout --psm 11 2>/dev/null || true)"
+    OCR_LOWER="${OCR_TEXT,,}"
+    [[ "$OCR_LOWER" == *"harness"* &&
+       "$OCR_LOWER" == *"2 checks"* ]] ||
+        fail "the plugin control-tab row or overflow control was not rendered"
+
+    shot_window control-tab-open-target "$main"
+    click_first_control_tab "$main"
+    sleep 0.5
+    ocr_snapshot "$main" control-tab-panel
+    [[ "$OCR_LOWER" == *"controls from control tab demo"* &&
+       "$OCR_LOWER" == *"all systems nominal"* &&
+       "$OCR_LOWER" == *"health"* &&
+       "$OCR_LOWER" == *"notifications"* &&
+       "$OCR_LOWER" == *"rumble-usercard-fixture"* ]] ||
+        fail "the host-rendered control panel was incomplete"
+
+    # Opening a panel focuses its first enabled native control. Activate the
+    # action with Space; this avoids coordinate/OCR assumptions about the
+    # low-contrast native button and proves keyboard operation.
+    shot_window control-tab-pulse-target "$main"
+    inner xdotool key --window "$main" --clearmodifiers space
+    read_window_size "$main" || fail "could not read the Chatterino window size"
+    local input_x=$((WINDOW_WIDTH / 2))
+    local input_y=$((WINDOW_HEIGHT - 35))
+    inner xdotool mousemove --sync --window "$main" "$input_x" "$input_y"
+    inner xdotool click --window "$main" 1
+    sleep 0.15
+    inner xdotool type --window "$main" --clearmodifiers --delay 15 focusstable
+    sleep 1.1
+    ocr_snapshot "$main" control-tab-focus
+    [[ "$OCR_LOWER" == *"focusstable"* ]] ||
+        fail "plugin state updates stole focus from the message input"
+    inner xdotool key --window "$main" --clearmodifiers ctrl+a BackSpace
+
+    click_first_control_tab "$main"
+    sleep 0.15
+    ocr_snapshot "$main" control-tab-pulse-result
+    [[ "$OCR_LOWER" == *"pulse complete"* ]] ||
+        fail "the host action did not publish its authoritative result"
+    inner xdotool key --window "$main" --clearmodifiers Tab space
+    sleep 0.2
+    ocr_snapshot "$main" control-tab-toggle-result
+    [[ "$OCR_LOWER" == *"toggle confirmed"* ]] ||
+        fail "the authoritative toggle result was not rendered"
+
+    shot_window control-tab-choice-target "$main"
+    inner xdotool key --window "$main" --clearmodifiers Tab End
+    sleep 0.2
+    ocr_snapshot "$main" control-tab-choice-result
+    [[ "$OCR_LOWER" == *"choice confirmed"* ]] ||
+        fail "the authoritative choice result was not rendered"
+
+    inner xdotool key --window "$main" --clearmodifiers Escape
+    sleep 0.15
+    ocr_snapshot "$main" control-tab-escape
+    [[ "$OCR_LOWER" != *"controls from"* ]] ||
+        fail "Escape did not close the control panel"
+
+    click_first_control_tab "$main"
+    sleep 0.15
+    read_window_size "$main" || fail "could not read the Chatterino window size"
+    inner xdotool mousemove --sync --window "$main" \
+        $((WINDOW_WIDTH / 2)) $((WINDOW_HEIGHT / 2))
+    inner xdotool click --window "$main" 1
+    sleep 0.15
+    ocr_snapshot "$main" control-tab-outside
+    [[ "$OCR_LOWER" != *"controls from"* ]] ||
+        fail "an outside click did not close the control panel"
+
+    inner xdotool windowactivate --sync "$main" 2>/dev/null
+    inner xdotool key --window "$main" --clearmodifiers ctrl+n
+    for ((i = 0; i < 200; i++)); do
+        ids="$(inner xdotool search --onlyvisible --class '[Cc]hatterino' \
+            2>/dev/null || true)"
+        while IFS= read -r candidate; do
+            if [[ "$candidate" =~ ^[0-9]+$ && "$candidate" != "$main" ]]; then
+                popup="$candidate"
+                break
+            fi
+        done <<<"$ids"
+        [[ -z "$popup" ]] || break
+        sleep 0.05
+    done
+    [[ -n "$popup" ]] || fail "Ctrl+N did not create a Chatterino popup window"
+    sleep 0.25
+    ocr_snapshot "$popup" control-tab-popup
+    [[ "$OCR_LOWER" == *"harness"* &&
+       "$OCR_LOWER" == *"2 checks"* ]] ||
+        fail "the plugin control tabs were not rendered in the popup window"
+    # The popup may be positioned or scaled differently from the main window;
+    # target the unique owner label rather than assuming a fixed x coordinate.
+    click_ocr_word "$popup" "harness" "control-tab-popup-click"
+    # A popup completes its client-layout pass asynchronously. Poll a bounded
+    # interval rather than sampling a transient empty backing store.
+    local popup_panel_ready=false
+    for ((i = 0; i < 20; i++)); do
+        ocr_snapshot "$popup" control-tab-popup-panel
+        if [[ "$OCR_LOWER" == *"controls from control tab demo"* ]]; then
+            popup_panel_ready=true
+            break
+        fi
+        sleep 0.1
+    done
+    [[ "$popup_panel_ready" == true ]] ||
+        fail "the plugin control panel did not open in the popup window"
+    # The popup-panel assertion above proves this supported window type. Let
+    # the session cleanup own its destruction: some X11 window managers remove
+    # the window before xdotool completes a synthetic close request, which is
+    # a teardown race rather than an interaction result.
+
+    # X11 can report a queued BadWindow from the popup's self-destruction on
+    # this next request. The main-window activation itself is best-effort; the
+    # following screenshot still authoritatively verifies the compact state.
+    inner xdotool windowactivate --sync "$main" >/dev/null 2>&1 || true
+    inner xdotool windowsize --sync "$main" 900 500
+    inner xdotool windowmove --sync "$main" 20 20
+    sleep 0.4
+    ocr_snapshot "$main" control-tab-compact-narrow
+    [[ "$OCR_LOWER" == *"harness"* ]] ||
+        fail "the control-tab compact overflow fallback was not usable"
+
+    local position=unknown
+    [[ -r "$tab_position_file" ]] && position="$(<"$tab_position_file")"
+    [[ -r "$scale_file" ]] && tested_scale="$(<"$scale_file")"
+    note "control-tabs=passed main=yes popup=yes controls=all focus=stable dismissal=escape-and-outside overflow=bounded compact=yes position=${position} scale=${tested_scale} rtl=unit-covered"
+    note "preview=${LAST_PREVIEW}"
+}
+
+control_tab_smoke_once()
+{
+    local has_source=false argument
+    for argument in "$@"; do
+        if [[ "$argument" == --control-tab-source ]]; then
+            has_source=true
+            break
+        fi
+    done
+    [[ "$has_source" == true ]] ||
+        fail "control-tab-smoke-once requires --control-tab-source PATH"
+    trap smoke_once_cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    # The isolated user-card fixture creates a normal Split and SplitInput
+    # without contacting a live service. That lets the control-tab pulse prove
+    # that state-only rerenders preserve actual message-input focus.
+    start_session --rumble-usercard-fixture "$@"
+    control_tab_smoke
+    stop_session
+    trap - EXIT INT TERM HUP
+}
+
+rumble_login_smoke()
+{
+    rumble_login_open
+
+    local display_geometry screen_width screen_height
+    display_geometry="$(inner xdpyinfo | sed -n \
+        's/.*dimensions: *\([0-9][0-9]*\)x\([0-9][0-9]*\).*/\1 \2/p' |
+        head -n 1)"
+    read -r screen_width screen_height <<<"$display_geometry"
+    [[ "$screen_width" =~ ^[1-9][0-9]*$ &&
+       "$screen_height" =~ ^[1-9][0-9]*$ ]] ||
+        fail "could not determine the nested display geometry"
+
+    local geometry x y width height
+    geometry="$(inner xdotool getwindowgeometry --shell \
+        "$RUMBLE_LOGIN_BROWSER")"
+    x="$(sed -n 's/^X=//p' <<<"$geometry")"
+    y="$(sed -n 's/^Y=//p' <<<"$geometry")"
+    width="$(sed -n 's/^WIDTH=//p' <<<"$geometry")"
+    height="$(sed -n 's/^HEIGHT=//p' <<<"$geometry")"
+    [[ "$x" =~ ^-?[0-9]+$ && "$y" =~ ^-?[0-9]+$ &&
+       "$width" =~ ^[1-9][0-9]*$ && "$height" =~ ^[1-9][0-9]*$ ]] ||
+        fail "could not determine the Rumble login window geometry"
+    ((x >= 0 && y >= 0 &&
+      x + width <= screen_width && y + height <= screen_height)) ||
+        fail "the Rumble login window does not fit the nested display"
+    ((width < screen_width || height < screen_height)) ||
+        fail "the Rumble login window unexpectedly filled the display"
+
+    local resized_width resized_height moved_x moved_y resized_geometry
+    local actual_x actual_y actual_width actual_height
+    resized_width=$((x + width + 50 <= screen_width ? width + 50 : width - 50))
+    resized_height=$((y + height + 50 <= screen_height ? height + 50 : height - 50))
+    moved_x=$((x + 20))
+    moved_y=$((y + 20))
+    inner xdotool windowsize --sync "$RUMBLE_LOGIN_BROWSER" \
+        "$resized_width" "$resized_height"
+    inner xdotool windowmove --sync "$RUMBLE_LOGIN_BROWSER" \
+        "$moved_x" "$moved_y"
+    resized_geometry="$(inner xdotool getwindowgeometry --shell \
+        "$RUMBLE_LOGIN_BROWSER")"
+    actual_x="$(sed -n 's/^X=//p' <<<"$resized_geometry")"
+    actual_y="$(sed -n 's/^Y=//p' <<<"$resized_geometry")"
+    actual_width="$(sed -n 's/^WIDTH=//p' <<<"$resized_geometry")"
+    actual_height="$(sed -n 's/^HEIGHT=//p' <<<"$resized_geometry")"
+    note "rumble-login-resize=requested-${resized_width}x${resized_height}+${moved_x}+${moved_y} actual-${actual_width}x${actual_height}+${actual_x}+${actual_y}"
+    [[ "$actual_width" == "$resized_width" &&
+       "$actual_height" == "$resized_height" ]] ||
+        fail "the Rumble login window could not be resized"
+    [[ "$actual_x" == "$moved_x" && "$actual_y" == "$moved_y" ]] ||
+        fail "the Rumble login window could not be moved"
+    note "rumble-login-window=fitted movable=true resizable=true initial-geometry=${width}x${height}+${x}+${y}"
+
+    sleep 2
+    shot_window rumble-login-browser root
+    note "preview=${LAST_PREVIEW}"
+
+    # The same button becomes Cancel while the driver is active. Activating the
+    # Add Account dialog first restores keyboard focus to that button without
+    # relying on scale-sensitive coordinates.
+    inner xdotool windowactivate --sync "$RUMBLE_LOGIN_DIALOG" 2>/dev/null
+    inner xdotool key --window "$RUMBLE_LOGIN_DIALOG" --clearmodifiers Return
+
+    local browser_closed=false
+    for ((i = 0; i < 600; i++)); do
+        if ! window_exists "$RUMBLE_LOGIN_BROWSER"; then
+            browser_closed=true
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ "$browser_closed" != true ]]; then
+        shot_window rumble-login-cancel-failure root
+        note "rumble-login-browser=still-open"
+        note "preview=${LAST_PREVIEW}"
+        return 1
+    fi
+
+    # Wait for the driver's finished callback, not only the browser window.
+    # OCR stays local and only the fixed cancellation marker is reported.
+    local callback_finished=false ocr lower
+    for ((i = 0; i < 100; i++)); do
+        shot_window rumble-login-cancelled "$RUMBLE_LOGIN_DIALOG"
+        magick "$LAST_FULL" -colorspace Gray -negate -threshold 35% \
+            "${session_dir}/rumble-login-status.png"
+        ocr="$(tesseract "${session_dir}/rumble-login-status.png" stdout \
+            --psm 6 2>/dev/null || true)"
+        lower="${ocr,,}"
+        if [[ "$lower" == *"login was cancelled"* ]]; then
+            callback_finished=true
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ "$callback_finished" != true ]]; then
+        note "rumble-login-browser=closed driver=unconfirmed"
+        note "preview=${LAST_PREVIEW}"
+        return 1
+    fi
+
+    note "rumble-login-browser=closed driver=stopped"
+    note "preview=${LAST_PREVIEW}"
+}
+
+accounts_open()
+{
+    local main settings
+    main="$(main_window || true)"
+    [[ -n "$main" ]] || fail "the Chatterino main window was not found"
+
+    # A main window can become visible while first-run initialization is still
+    # completing. Retry the harmless shortcut instead of spending a model turn
+    # deciding whether a single early key event was lost.
+    settings=""
+    for ((i = 0; i < 1200; i++)); do
+        settings="$(first_window --name '^Chatterino Settings$' || true)"
+        [[ -n "$settings" ]] && break
+        if ((i % 20 == 0)); then
+            inner xdotool windowactivate --sync "$main" 2>/dev/null
+            inner xdotool key --window "$main" --clearmodifiers ctrl+p
+        fi
+        sleep 0.05
+    done
+    if [[ -z "$settings" ]]; then
+        shot_window rumble-login-settings-failure root
+        note "rumble-login-settings=not-opened"
+        note "preview=${LAST_PREVIEW}"
+        return 1
+    fi
+
+    # Accounts is the fourth visible settings category at the harness's fixed
+    # geometry and scale.
+    inner xdotool mousemove --sync --window "$settings" 130 250
+    inner xdotool click --window "$settings" 1
+    sleep 0.2
+    note "accounts-settings-window=${settings}"
+}
+
+account_add_open()
+{
+    local settings dialog
+    accounts_open
+    settings="$(first_window --name '^Chatterino Settings$' || true)"
+    [[ -n "$settings" ]] || fail "the Accounts settings window was not found"
+    inner xdotool mousemove --sync --window "$settings" 366 120
+    inner xdotool click --window "$settings" 1
+    dialog="$(wait_for_window --name '^Add new account$' 100 || true)"
+    [[ -n "$dialog" ]] || fail "the Add new account dialog did not open"
+    note "add-account-window=${dialog}"
+}
+
+rumble_account_tab_open()
+{
+    local dialog
+    account_add_open
+    dialog="$(first_window --name '^Add new account$' || true)"
+    [[ -n "$dialog" ]] || fail "the Add new account dialog was not found"
+    inner xdotool mousemove --sync --window "$dialog" 340 50
+    inner xdotool click --window "$dialog" 1
+    sleep 0.5
+    note "rumble-account-window=${dialog}"
+}
+
+rumble_login_open()
+{
+    local settings browser
+    local dialog ocr lower ready=false
+    rumble_account_tab_open
+    settings="$(first_window --name '^Chatterino Settings$' || true)"
+    dialog="$(first_window --name '^Add new account$' || true)"
+    [[ -n "$settings" && -n "$dialog" ]] ||
+        fail "the Rumble account dialog was not found"
+
+    for ((i = 0; i < 300; i++)); do
+        shot_window rumble-login-preparation "$dialog"
+        magick "$LAST_FULL" -colorspace Gray -negate -threshold 35% \
+            "${session_dir}/rumble-login-status.png"
+        ocr="$(tesseract "${session_dir}/rumble-login-status.png" stdout \
+            --psm 6 2>/dev/null || true)"
+        lower="${ocr,,}"
+        if [[ "$lower" == *"ready for secure rumble sign-in"* ]]; then
+            ready=true
+            break
+        fi
+        if [[ "$lower" == *"could not prepare"* ||
+              "$lower" == *"credential storage is unavailable"* ]]; then
+            break
+        fi
+        sleep 0.2
+    done
+    if [[ "$ready" != true ]]; then
+        note "rumble-login-preparation=not-ready"
+        note "preview=${LAST_PREVIEW}"
+        return 1
+    fi
+
+    inner xdotool windowactivate --sync "$dialog" 2>/dev/null
+    inner xdotool mousemove --sync --window "$dialog" 419 315
+    inner xdotool click --window "$dialog" 1
+
+    browser="$(wait_for_window --class \
+        '(Google-chrome-for-testing|Chromium|Google-chrome|Microsoft-edge|Brave-browser|firefox)' 1200 || true)"
+    if [[ -z "$browser" ]]; then
+        browser="$(wait_for_window --name \
+            '(Google Chrome for Testing|Chromium|Google Chrome|Microsoft Edge|Brave|Firefox)' 20 || true)"
+    fi
+    if [[ -z "$browser" ]]; then
+        shot_window rumble-login-launch-failure "$settings"
+        note "rumble-login-browser=not-opened"
+        note "preview=${LAST_PREVIEW}"
+        return 1
+    fi
+
+    # A Chromium process exposes its blank app window before ChromeDriver has
+    # attached, applied mobile emulation, and initiated navigation. Waiting for
+    # a non-placeholder title makes screenshots and attended input begin on the
+    # actual public login form instead of racing the initial New Tab window.
+    local title title_lower page_ready=false
+    for ((i = 0; i < 600; i++)); do
+        if ! window_exists "$browser"; then
+            break
+        fi
+        title="$(inner xdotool getwindowname "$browser" 2>/dev/null || true)"
+        title_lower="${title,,}"
+        if [[ -n "$title_lower" &&
+              "$title_lower" != *"new tab"* &&
+              "$title_lower" != *"about:blank"* &&
+              "$title_lower" != "rumble.com_/account/login" &&
+              "$title_lower" != "chromium" &&
+              "$title_lower" != "google chrome" &&
+              "$title_lower" != "microsoft edge" &&
+              "$title_lower" != "brave" &&
+              "$title_lower" != "firefox" ]]; then
+            page_ready=true
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ "$page_ready" != true ]]; then
+        shot_window rumble-login-navigation-failure "$settings"
+        note "rumble-login-browser=page-not-ready"
+        note "preview=${LAST_PREVIEW}"
+        return 1
+    fi
+
+    RUMBLE_LOGIN_SETTINGS="$settings"
+    RUMBLE_LOGIN_DIALOG="$dialog"
+    RUMBLE_LOGIN_BROWSER="$browser"
+    note "rumble-login-browser=opened"
+}
+
+rumble_login_live()
+{
+    rumble_login_open
+    note "awaiting-user-login=true timeout-seconds=600"
+
+    local browser_closed=false
+    for ((i = 0; i < 12000; i++)); do
+        if ! window_exists "$RUMBLE_LOGIN_BROWSER"; then
+            browser_closed=true
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ "$browser_closed" != true ]]; then
+        note "rumble-login=timeout"
+        return 1
+    fi
+
+    local ocr_path="${session_dir}/rumble-login-status.png"
+    local outcome=unconfirmed ocr lower
+    for ((i = 0; i < 240; i++)); do
+        if ! window_exists "$RUMBLE_LOGIN_DIALOG"; then
+            inner xdotool windowactivate --sync \
+                "$RUMBLE_LOGIN_SETTINGS" 2>/dev/null
+            inner import -silent -window \
+                "$RUMBLE_LOGIN_SETTINGS" "$ocr_path"
+            ocr="$(tesseract "$ocr_path" stdout --psm 6 \
+                2>/dev/null || true)"
+            lower="${ocr,,}"
+            if [[ "$lower" == *"rumble"* ]]; then
+                outcome=account-added
+                break
+            fi
+        else
+            inner import -silent -window \
+                "$RUMBLE_LOGIN_DIALOG" "$ocr_path"
+            magick "$ocr_path" -colorspace Gray -negate -threshold 35% \
+                "${ocr_path}.prepared"
+            ocr="$(tesseract "${ocr_path}.prepared" stdout --psm 6 \
+                2>/dev/null || true)"
+            lower="${ocr,,}"
+            if [[ "$lower" == *"secure credential storage is unavailable"* ]]
+            then
+                outcome="storage-unavailable"
+                break
+            fi
+            if [[ "$lower" == *"access to secure credential storage was denied"* ]]
+            then
+                outcome="storage-denied"
+                break
+            fi
+            if [[ "$lower" == *"could not update secure credential storage"* ]]
+            then
+                outcome="storage-failed"
+                break
+            fi
+            if [[ "$lower" == *"could not validate the session"* ]]; then
+                outcome="validation-failed"
+                break
+            fi
+            if [[ "$lower" == *"rejected and cleared the session"* ||
+                  "$lower" == *"browser session was rejected locally"* ]]
+            then
+                outcome="session-rejected"
+                break
+            fi
+            if [[ "$lower" == *"did not return an account name"* ||
+                  "$lower" == *"did not return a valid account name"* ]]
+            then
+                outcome="account-name-missing"
+                break
+            fi
+            if [[ "$lower" == *"login was cancelled"* ]]; then
+                outcome=cancelled
+                break
+            fi
+            if [[ "$lower" == *"timed out"* ]]; then
+                outcome=timeout
+                break
+            fi
+            if [[ "$lower" == *"could not"* ||
+                  "$lower" == *"rejected"* ]]; then
+                outcome=failed
+                break
+            fi
+        fi
+        sleep 0.25
+    done
+    rm -f "$ocr_path" "${ocr_path}.prepared"
+    note "rumble-login=${outcome} browser=closed driver=stopped"
+    [[ "$outcome" == account-added ]]
+}
+
+rumble_login_smoke_once()
+{
+    trap smoke_once_cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    start_session "$@"
+    rumble_login_smoke
+    stop_session
+    trap - EXIT INT TERM HUP
+}
+
+rumble_login_live_once()
+{
+    trap smoke_once_cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    start_session "$@"
+    rumble_login_live
+    stop_session
+    trap - EXIT INT TERM HUP
+}
+
+case "$command_name" in
+    help)
+        usage
+        ;;
+    doctor)
+        doctor "$@"
+        ;;
+    start)
+        start_session "$@"
+        ;;
+    status)
+        [[ $# -eq 0 ]] || fail "status takes no arguments"
+        session_status
+        ;;
+    env)
+        [[ $# -eq 0 ]] || fail "env takes no arguments"
+        print_env
+        ;;
+    windows)
+        [[ $# -eq 0 ]] || fail "windows takes no arguments"
+        list_windows
+        ;;
+    accounts-open)
+        [[ $# -eq 0 ]] || fail "accounts-open takes no arguments"
+        accounts_open
+        ;;
+    account-add-open)
+        [[ $# -eq 0 ]] || fail "account-add-open takes no arguments"
+        account_add_open
+        ;;
+    rumble-account-tab-open)
+        [[ $# -eq 0 ]] || fail "rumble-account-tab-open takes no arguments"
+        rumble_account_tab_open
+        ;;
+    rumble-open)
+        rumble_open "$@"
+        ;;
+    rumble-status)
+        [[ $# -eq 0 ]] || fail "rumble-status takes no arguments"
+        rumble_status
+        ;;
+    rumble-login-open)
+        [[ $# -eq 0 ]] || fail "rumble-login-open takes no arguments"
+        rumble_login_open
+        ;;
+    rumble-login-smoke)
+        [[ $# -eq 0 ]] || fail "rumble-login-smoke takes no arguments"
+        rumble_login_smoke
+        ;;
+    rumble-smoke)
+        rumble_smoke "$@"
+        ;;
+    rumble-smoke-once)
+        rumble_smoke_once "$@"
+        ;;
+    rumble-usercard-smoke)
+        [[ $# -eq 0 ]] || fail "rumble-usercard-smoke takes no arguments"
+        rumble_usercard_smoke
+        ;;
+    rumble-usercard-smoke-once)
+        rumble_usercard_smoke_once "$@"
+        ;;
+    rumble-reply-smoke)
+        [[ $# -eq 0 ]] || fail "rumble-reply-smoke takes no arguments"
+        rumble_reply_smoke
+        ;;
+    rumble-reply-smoke-once)
+        rumble_reply_smoke_once "$@"
+        ;;
+    rumble-lifecycle-smoke)
+        [[ $# -eq 0 ]] || fail "rumble-lifecycle-smoke takes no arguments"
+        rumble_lifecycle_smoke
+        ;;
+    rumble-lifecycle-smoke-once)
+        rumble_lifecycle_smoke_once "$@"
+        ;;
+    automatic-routing-smoke)
+        [[ $# -eq 0 ]] || fail "automatic-routing-smoke takes no arguments"
+        automatic_routing_smoke
+        ;;
+    automatic-routing-smoke-once)
+        automatic_routing_smoke_once "$@"
+        ;;
+    compact-tab-reveal-smoke)
+        [[ $# -eq 0 ]] || fail "compact-tab-reveal-smoke takes no arguments"
+        compact_tab_reveal_smoke
+        ;;
+    compact-tab-reveal-smoke-once)
+        compact_tab_reveal_smoke_once "$@"
+        ;;
+    control-tab-smoke)
+        [[ $# -eq 0 ]] || fail "control-tab-smoke takes no arguments"
+        control_tab_smoke
+        ;;
+    control-tab-smoke-once)
+        control_tab_smoke_once "$@"
+        ;;
+    rumble-login-smoke-once)
+        rumble_login_smoke_once "$@"
+        ;;
+    rumble-login-live-once)
+        rumble_login_live_once "$@"
+        ;;
+    shot)
+        [[ $# -le 2 ]] || fail "shot accepts at most NAME and WINDOW"
+        take_shot "$@"
+        ;;
+    stop)
+        [[ $# -eq 0 ]] || fail "stop takes no arguments"
+        stop_session
+        ;;
+    *)
+        fail "unknown command: ${command_name}"
+        ;;
+esac

@@ -1,0 +1,305 @@
+// SPDX-FileCopyrightText: 2017 Contributors to Chatterino <https://chatterino.com>
+//
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
+#include "common/enums/MessageContext.hpp"
+#include "controllers/completion/TabCompletionModel.hpp"
+#include "messages/MessageDraft.hpp"
+#include "messages/LimitedQueue.hpp"
+#include "messages/MessageFlag.hpp"
+#include "messages/MessageSink.hpp"
+
+#include <magic_enum/magic_enum.hpp>
+#include <pajlada/signals/signal.hpp>
+#include <QDate>
+#include <QString>
+#include <QTimer>
+
+#include <memory>
+#include <functional>
+#include <optional>
+#include <span>
+
+namespace chatterino {
+
+struct Message;
+using MessagePtr = std::shared_ptr<const Message>;
+using MessagePtrMut = std::shared_ptr<Message>;
+
+enum class MessagePlatform : uint8_t;
+
+class EmoteMap;
+
+class Channel : public std::enable_shared_from_this<Channel>, public MessageSink
+{
+public:
+    enum class SendOutcome : std::uint8_t {
+        Confirmed,
+        DefiniteFailure,
+        Ambiguous,
+        Cancelled,
+        Unsupported,
+    };
+    struct SendResult {
+        SendOutcome outcome = SendOutcome::Unsupported;
+        QString userMessage;
+    };
+    using SendCallback = std::function<void(SendResult)>;
+    // This is for Lua. See scripts/make_luals_meta.py
+    /**
+     * @exposeenum c2.ChannelType
+     */
+    enum class Type : std::uint8_t {
+        /// This channel may not be backed by a real channel.
+        ///
+        /// Messages sent to this channel are not logged.
+        None,
+        /// Direct
+        Direct,
+        /// Twitch
+        Twitch,
+        /// TwitchWhispers
+        TwitchWhispers,
+        /// TwitchWatching
+        TwitchWatching,
+        /// TwitchMentions
+        TwitchMentions,
+        /// TwitchLive
+        TwitchLive,
+        /// TwitchAutomod
+        TwitchAutomod,
+        /// TwitchEnd
+        TwitchEnd,
+        Kick,
+        /// Misc
+        Misc,
+        Multi,
+        Rumble,
+    };
+
+    explicit Channel(const QString &name, Type type);
+    ~Channel() override;
+
+    // SIGNALS
+    pajlada::Signals::Signal<MessagePtr &, std::optional<MessageFlags>>
+        messageAppended;
+    pajlada::Signals::Signal<std::vector<MessagePtr> &> messagesAddedAtStart;
+    /// (index, prev-message, replacement)
+    pajlada::Signals::Signal<size_t, const MessagePtr &, const MessagePtr &>
+        messageReplaced;
+    /// Invoked when some number of messages were filled in using time received
+    pajlada::Signals::Signal<const std::vector<MessagePtr> &> filledInMessages;
+    pajlada::Signals::NoArgSignal displayNameChanged;
+    pajlada::Signals::NoArgSignal messagesCleared;
+
+    Type getType() const;
+    const QString &getName() const;
+    virtual const QString &getDisplayName() const;
+    virtual const QString &getLocalizedName() const;
+    bool isTwitchChannel() const;
+    bool isKickChannel() const;
+    bool isRumbleChannel() const;
+    bool isTwitchOrKickChannel() const;
+    virtual bool isEmpty() const;
+
+    std::vector<MessagePtr> getMessageSnapshot() const;
+    std::vector<MessagePtr> getMessageSnapshot(size_t nItems) const;
+
+    /// Essentially the same as #getMessageSnapshot(size_t), but the returned
+    /// vector holds `std::shared_ptr<Message>`. This should only be used in
+    /// plugins, because they take messages as `Message` but check that they're
+    /// frozen.
+    std::vector<MessagePtrMut> getMessageSnapshotMut(size_t nItems) const;
+
+    /// Returns the last message (the one at the bottom). If the channel has no
+    /// messages, this will return an empty shared pointer.
+    MessagePtr getLastMessage() const;
+
+    // MESSAGES
+    // overridingFlags can be filled in with flags that should be used instead
+    // of the message's flags. This is useful in case a flag is specific to a
+    // type of split
+    void addMessage(
+        MessagePtr message, MessageContext context,
+        std::optional<MessageFlags> overridingFlags = std::nullopt) final;
+    void addMessagesAtStart(const std::vector<MessagePtr> &messages_);
+
+    void addSystemMessage(const QString &contents);
+
+    /// Inserts the given messages in order by Message::serverReceivedTime.
+    void fillInMissingMessages(const std::vector<MessagePtr> &messages);
+
+    void addOrReplaceTimeout(MessagePtr message, const QDateTime &now) final;
+    void addOrReplaceClearChat(MessagePtr message, const QDateTime &now) final;
+    void disableAllMessages() final;
+    void replaceMessage(const MessagePtr &message,
+                        const MessagePtr &replacement);
+    void replaceMessage(size_t index, const MessagePtr &replacement);
+    void replaceMessage(size_t hint, const MessagePtr &message,
+                        const MessagePtr &replacement);
+    void disableMessage(const QString &messageID);
+
+    void mergeFrom(std::span<std::span<const MessagePtr>> sources);
+
+    /// Removes all messages from this channel and invokes #messagesCleared
+    void clearMessages();
+
+    MessagePtr findMessageByID(QStringView messageID) final;
+
+    bool hasMessages() const;
+
+    size_t countMessages() const;
+
+    void applySimilarityFilters(const MessagePtr &message) const final;
+
+    MessageSinkTraits sinkTraits() const final;
+
+    // CHANNEL INFO
+    virtual bool canSendMessage() const;
+    virtual bool isWritable() const;  // whether split input will be usable
+    /// Returns a provider-neutral snapshot used for side-effect-free draft
+    /// evaluation. Providers override this to add account/channel identities,
+    /// length limits, and constraints without requiring caller type checks.
+    virtual MessageSendContext messageSendContext() const;
+    MessageDraftEvaluation evaluateMessageDraft(
+        const MessageDraft &draft) const;
+    virtual void sendMessage(const QString &message);
+    /// Provider-neutral one-shot submission. Implementations must invoke the
+    /// callback at most once and must never automatically retry a mutation.
+    virtual void sendMessageAsync(QString message, SendCallback callback);
+    virtual bool isMod() const;
+    virtual bool isBroadcaster() const;
+    virtual bool hasModRights() const;
+    virtual bool hasHighRateLimit() const;
+    virtual bool isLive() const;
+    virtual bool isRerun() const;
+    virtual bool shouldIgnoreHighlights() const;
+    virtual bool canReconnect() const;
+    virtual void reconnect();
+    virtual QString getCurrentStreamID() const;
+
+    static std::shared_ptr<Channel> getEmpty();
+
+    /// Update the user's last message and insert the personal emotes if necessary.
+    void upsertPersonalSeventvEmotes(
+        const QString &userLogin,
+        const std::shared_ptr<const EmoteMap> &emoteMap);
+
+    MessagePlatform messagePlatform() const;
+
+    TabCompletionModel *completionModel;
+    QDate lastDate_;
+
+protected:
+    virtual void onConnected();
+    virtual void messageRemovedFromStart(const MessagePtr &msg);
+    QString platform_;
+
+private:
+    bool canRecurse() const noexcept;
+
+    const QString name_;
+    LimitedQueue<MessagePtr> messages_;
+    Type type_;
+    bool anythingLogged_ = false;
+
+    /// Recursion count for message signals.
+    ///
+    /// This is intended to prevent _trivial_ infinite recursion of signals
+    /// (e.g. unconditionally adding a message in `messageAppended`). It is not
+    /// intended to prevent all infinite recursion. That will still crash the
+    /// program.
+    uint8_t recursionCount_ = 0;
+
+    QTimer clearCompletionModelTimer_;
+
+    MessagePlatform messagePlatform_;
+};
+
+using ChannelPtr = std::shared_ptr<Channel>;
+
+/// Provider-neutral identity retained by a view independently of its current
+/// runtime channel.  This is intentionally layout-only data: providers must
+/// put a stable public locator here, never a response URL, account datum, or
+/// opaque runtime channel ID.
+struct ChannelLayoutIdentity {
+    QString platform;
+    QString locator;
+
+    friend bool operator==(const ChannelLayoutIdentity &,
+                           const ChannelLayoutIdentity &) = default;
+};
+
+class IndirectChannel
+{
+    struct Data {
+        ChannelPtr channel;
+        Channel::Type type;
+        std::optional<ChannelLayoutIdentity> layoutIdentity;
+        pajlada::Signals::NoArgSignal changed;
+
+        Data(ChannelPtr channel, Channel::Type type,
+             std::optional<ChannelLayoutIdentity> layoutIdentity);
+    };
+
+public:
+    IndirectChannel(ChannelPtr channel,
+                    Channel::Type type = Channel::Type::Direct,
+                    std::optional<ChannelLayoutIdentity> layoutIdentity = {});
+
+    ChannelPtr get() const;
+    void reset(ChannelPtr channel);
+    pajlada::Signals::NoArgSignal &getChannelChanged();
+    Channel::Type getType() const;
+    const std::optional<ChannelLayoutIdentity> &layoutIdentity() const;
+    void reconnect() const;
+
+private:
+    std::shared_ptr<Data> data_;
+};
+
+}  // namespace chatterino
+
+// NOLINTBEGIN(readability-identifier-naming)
+template <>
+constexpr magic_enum::customize::customize_t
+    magic_enum::customize::enum_name<chatterino::Channel::Type>(
+        chatterino::Channel::Type value) noexcept
+{
+    using Type = chatterino::Channel::Type;
+
+    // These names are used for encoding channels in the window layout settings.
+    // They need to be stable across Chatterino versions.
+    switch (value)
+    {
+        case Type::Twitch:
+            return "twitch";
+        case Type::TwitchAutomod:
+            return "automod";
+        case Type::TwitchMentions:
+            return "mentions";
+        case Type::TwitchWatching:
+            return "watching";
+        case Type::TwitchWhispers:
+            return "whispers";
+        case Type::TwitchLive:
+            return "live";
+        case Type::Misc:
+            return "misc";
+        case Type::Kick:
+            return "kick";
+        case Type::Multi:
+            return "multi";
+        case Type::Rumble:
+            return "rumble";
+
+        case Type::None:
+        case Type::Direct:
+        case Type::TwitchEnd:
+            return default_tag;  // FIXME: Remove these (#5703)
+    }
+    return default_tag;
+}
+// NOLINTEND(readability-identifier-naming)

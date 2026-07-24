@@ -1,0 +1,25 @@
+<RCC>
+  <qresource prefix="/">
+    <file>001-mimeapps.list</file>
+    <file alias="certificates/test-chain.pem">../../lib/certify/tests/res/success_chains/github.com.crt</file>
+    <file alias="badges/platform-rumble-18.webp">../../resources/badges/platform-rumble-18.webp</file>
+    <file alias="badges/platform-rumble-36.webp">../../resources/badges/platform-rumble-36.webp</file>
+    <file alias="rumble/provenance.json">../fixtures/rumble/provenance.json</file>
+    <file alias="rumble/scenarios.json">../fixtures/rumble/scenarios.json</file>
+    <file alias="rumble/raw/channel-live.html">../fixtures/rumble/raw/channel-live.html</file>
+    <file alias="rumble/raw/channel-offline.html">../fixtures/rumble/raw/channel-offline.html</file>
+    <file alias="rumble/raw/embed-live.json">../fixtures/rumble/raw/embed-live.json</file>
+    <file alias="rumble/raw/embed-offline.json">../fixtures/rumble/raw/embed-offline.json</file>
+    <file alias="rumble/raw/http-error.json">../fixtures/rumble/raw/http-error.json</file>
+    <file alias="rumble/raw/session-expired.json">../fixtures/rumble/raw/session-expired.json</file>
+    <file alias="rumble/raw/sse-delayed.txt">../fixtures/rumble/raw/sse-delayed.txt</file>
+    <file alias="rumble/raw/sse-duplicate.txt">../fixtures/rumble/raw/sse-duplicate.txt</file>
+    <file alias="rumble/raw/sse-live.txt">../fixtures/rumble/raw/sse-live.txt</file>
+    <file alias="rumble/raw/sse-malformed.txt">../fixtures/rumble/raw/sse-malformed.txt</file>
+    <file alias="rumble/raw/sse-out-of-order.txt">../fixtures/rumble/raw/sse-out-of-order.txt</file>
+    <file alias="rumble/raw/sse-reconnect-first.txt">../fixtures/rumble/raw/sse-reconnect-first.txt</file>
+    <file alias="rumble/raw/sse-reconnect-second.txt">../fixtures/rumble/raw/sse-reconnect-second.txt</file>
+    <file alias="rumble/raw/sse-state-events.txt">../fixtures/rumble/raw/sse-state-events.txt</file>
+    <file alias="rumble/raw/sse-unknown.txt">../fixtures/rumble/raw/sse-unknown.txt</file>
+  </qresource>
+</RCC>

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Chatterino/chatterino2/master/docs/plugin-info.schema.json",
+  "name": "Tab Emit",
+  "description": "Emits Chatterino selected tab/channel changes to a localhost WebSocket listener.",
+  "authors": ["the-fpp"],
+  "homepage": "https://github.com/the-fpp/klatterino",
+  "tags": [
+    "debug",
+    "tabs",
+    "websocket"
+  ],
+  "version": "0.11.0",
+  "license": "MIT",
+  "permissions": [
+    {
+      "type": "Network"
+    }
+  ]
+}

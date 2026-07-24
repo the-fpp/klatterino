@@ -1,0 +1,431 @@
+// SPDX-FileCopyrightText: 2023 Contributors to Chatterino <https://chatterino.com>
+//
+// SPDX-License-Identifier: MIT
+
+#include "controllers/accounts/AccountController.hpp"
+#include "controllers/filters/lang/expressions/IdentifierExpression.hpp"
+#include "controllers/filters/lang/expressions/UnaryOperation.hpp"
+#include "controllers/filters/lang/Filter.hpp"
+#include "controllers/filters/lang/Tokenizer.hpp"
+#include "controllers/filters/lang/Types.hpp"
+#include "controllers/highlights/HighlightController.hpp"
+#include "messages/Message.hpp"
+#include "messages/MessageBuilder.hpp"
+#include "mocks/BaseApplication.hpp"
+#include "mocks/Channel.hpp"
+#include "mocks/ChatterinoBadges.hpp"
+#include "mocks/EmoteController.hpp"
+#include "mocks/EmptyApplication.hpp"
+#include "mocks/Logging.hpp"
+#include "mocks/TwitchIrcServer.hpp"
+#include "mocks/UserData.hpp"
+#include "providers/bttv/BttvBadges.hpp"
+#include "providers/ffz/FfzBadges.hpp"
+#include "providers/seventv/SeventvBadges.hpp"
+#include "providers/twitch/TwitchBadge.hpp"
+#include "providers/twitch/TwitchBadges.hpp"
+#include "Test.hpp"
+
+#include <QColor>
+#include <QVariant>
+
+using namespace Qt::Literals;
+using namespace chatterino;
+using namespace chatterino::filters;
+using chatterino::mock::MockChannel;
+
+namespace {
+
+class MockApplication : public mock::BaseApplication
+{
+public:
+    MockApplication()
+        : highlights(this->settings, &this->accounts)
+    {
+    }
+
+    EmoteController *getEmotes() override
+    {
+        return &this->emotes;
+    }
+
+    IUserDataController *getUserData() override
+    {
+        return &this->userData;
+    }
+
+    AccountController *getAccounts() override
+    {
+        return &this->accounts;
+    }
+
+    ITwitchIrcServer *getTwitch() override
+    {
+        return &this->twitch;
+    }
+
+    IChatterinoBadges *getChatterinoBadges() override
+    {
+        return &this->chatterinoBadges;
+    }
+
+    FfzBadges *getFfzBadges() override
+    {
+        return &this->ffzBadges;
+    }
+
+    BttvBadges *getBttvBadges() override
+    {
+        return &this->bttvBadges;
+    }
+
+    SeventvBadges *getSeventvBadges() override
+    {
+        return &this->seventvBadges;
+    }
+
+    HighlightController *getHighlights() override
+    {
+        return &this->highlights;
+    }
+
+    ILogging *getChatLogger() override
+    {
+        return &this->logging;
+    }
+
+    TwitchBadges *getTwitchBadges() override
+    {
+        return &this->twitchBadges;
+    }
+
+    mock::EmptyLogging logging;
+    AccountController accounts;
+    mock::EmoteController emotes;
+    mock::UserDataController userData;
+    mock::MockTwitchIrcServer twitch;
+    mock::ChatterinoBadges chatterinoBadges;
+    FfzBadges ffzBadges;
+    BttvBadges bttvBadges;
+    SeventvBadges seventvBadges;
+    HighlightController highlights;
+    TwitchBadges twitchBadges;
+};
+
+class FiltersF : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        this->mockApplication = std::make_unique<MockApplication>();
+    }
+
+    void TearDown() override
+    {
+        this->mockApplication.reset();
+    }
+
+    std::unique_ptr<MockApplication> mockApplication;
+};
+
+}  // namespace
+
+namespace chatterino::filters {
+
+std::ostream &operator<<(std::ostream &os, Type t)
+{
+    os << typeToString(t);
+    return os;
+}
+
+}  // namespace chatterino::filters
+
+TEST(Filters, Validity)
+{
+    std::vector<std::pair<QString, bool>> tests{
+        {"", false},
+        {R".(1 + 1).", true},
+        {R".(1 + (1==1)).", false},
+        {R".((1==1) + 1).", false},
+        {R".(1 + (1 + (1==1))).", false},
+        {R".(1 % "").", false},
+        {R".("" % 1).", false},
+        {R".(1 - "").", false},
+        {R".("" - 1).", false},
+        {R".(1 * "").", false},
+        {R".("" * 1).", false},
+        {R".(1 / "").", false},
+        {R".("" / 1).", false},
+        {R".("" || (1==1)).", false},
+        {R".((1!=1) && 1).", false},
+        {R".(1 < "").", false},
+        {R".("" > 1).", false},
+        {R".("" >= 1).", false},
+        {R".(author.badges <= 1).", false},
+        {R".(1 + ).", false},
+        {R".(1 + 1)).", false},
+        {R".((1 + 1).", false},
+        {R".(author.name contains "icelys").", true},
+        {R".(author.color == "#ff0000").", true},
+        {R".(author.name - 5).", false},  // can't perform String - Int
+        {R".(message.content match {r"(\d\d)/(\d\d)/(\d\d\d\d)", 3}).", true},
+        {R".("abc" + 123 == "abc123").", true},
+        {R".(123 + "abc" == "hello").", false},
+        {R".(flags.reply && flags.automod).", true},
+        {R".(unknown.identifier).", false},
+        {R".(10 startswith 1).", false},
+        {R".(10 startswith "").", false},
+        {R".("10" endswith 1).", false},
+        {R".(1 contains "").", false},
+        {R".("10" contains 1).", false},
+        {R".((1+"") contains 1).", false},
+        {R".("10" match 1).", false},
+        {R".(1 match r"1").", false},
+        {
+            R".(channel.name == "forsen" && author.badges contains "moderator").",
+            true,
+        },
+        {R".({(1+""), 2}).", false},
+        {R".("abc" match {ri"foo", "bar"}).", false},
+        {R".(!{}).", false},
+        {R".(!(1+"")).", false},
+        {R".({).", false},
+        {R".({,).", false},
+        {R".({1!).", false},
+        {R".((1) "").", false},
+        {R".(().", false},
+        {R".()").", false},
+        {R".((1()").", false},
+        {R".("foo).", false},
+        {R".(foo").", false},
+    };
+
+    for (const auto &[input, expected] : tests)
+    {
+        auto filterResult = Filter::fromString(input);
+        bool isValid = std::holds_alternative<Filter>(filterResult);
+        EXPECT_EQ(isValid, expected)
+            << "Filter::fromString( " << input << " ) should be "
+            << (expected ? "valid" : "invalid");
+    }
+}
+
+TEST(Filters, TypeSynthesis)
+{
+    using T = Type;
+    struct TestCase {
+        QString input;
+        T type;
+    };
+
+    // clang-format off
+    std::vector<TestCase> tests
+    {
+        {R".(1 + 1).", T::Int},
+        {R".(author.color).", T::Color},
+        {R".(author.name).", T::String},
+        {R".(!author.subbed).", T::Bool},
+        {R".(author.badges).", T::StringList},
+        {R".(channel.name == "forsen" && author.badges contains "moderator").", T::Bool},
+        {R".(message.content match {r"(\d\d)/(\d\d)/(\d\d\d\d)", 3}).", T::String},
+    };
+    // clang-format on
+
+    for (const auto &[input, expected] : tests)
+    {
+        auto filterResult = Filter::fromString(input);
+        bool isValid = std::holds_alternative<Filter>(filterResult);
+        ASSERT_TRUE(isValid)
+            << "Filter::fromString( " << input << " ) is invalid";
+
+        auto filter = std::move(std::get<Filter>(filterResult));
+        T type = filter.returnType();
+        EXPECT_EQ(type, expected)
+            << "Filter{ " << input << " } has type " << type << " instead of "
+            << expected << ".\nDebug: " << filter.debugString();
+    }
+}
+
+TEST(Filters, Evaluation)
+{
+    Message message;
+    message.displayName = "icelys";
+    message.usernameColor = QColor(0xff0000);
+    message.messageText = "hey there :) 2038-01-19 123 456";
+    message.channelName = "forsen";
+    message.twitchBadges = {
+        TwitchBadge("moderator", ""),
+        TwitchBadge("staff", ""),
+    };
+    message.externalBadges = {"frankerfacez:bot"};
+    RunContext ctx{
+        .message = message,
+        .channel = nullptr,
+    };
+
+    std::vector<std::pair<QString, QVariant>> tests{
+        // Evaluation semantics
+        {R".(1 + 1).", QVariant(2)},
+        {R".(!(1 == 1)).", QVariant(false)},
+        {R".(2 + 3 * 4).",
+         QVariant(20)},  // math operators have the same precedence
+        {R".(1 > 2 || 3 >= 3).", QVariant(true)},
+        {R".(1 > 2 && 3 > 1).", QVariant(false)},
+        {R".(1 > 0 && 3 > 1).", QVariant(true)},
+        {R".(0 <= 0 && 3 < 1).", QVariant(false)},
+        {R".("abc" + 123).", QVariant("abc123")},
+        {R".("abc" + "456").", QVariant("abc456")},
+        {R".(3 - 4).", QVariant(-1)},
+        {R".(3 * 4).", QVariant(12)},
+        {R".(8 / 3).", QVariant(2)},
+        {R".(7 % 3).", QVariant(1)},
+        {R".(5 == 5).", QVariant(true)},
+        {R".(5 == "5").", QVariant(true)},
+        {R".(5 != 7).", QVariant(true)},
+        {R".(5 == "abc").", QVariant(false)},
+        // String comparison is case-insensitive
+        {R".("ABC123" == "abc123").", QVariant(true)},
+        {R".("ABC123" != "abc123").", QVariant(false)},
+        {R".("Hello world" contains "Hello").", QVariant(true)},
+        {R".("Hello world" contains "LLO W").",
+         QVariant(true)},  // Case-insensitive
+        {R".({"abc", "def"} contains "abc").", QVariant(true)},
+        {R".({"abc", "def"} contains "ABC").",
+         QVariant(true)},  // Case-insensitive when list is all strings
+        {R".({123, "def"} contains "DEF").",
+         QVariant(false)},  // Case-sensitive if list not all strings
+        {R".({"a123", "b456"} startswith "a123").", QVariant(true)},
+        {R".({"a123", "b456"} startswith "A123").", QVariant(true)},
+        {R".({"a123", 1} startswith "A123").", QVariant(false)},
+        {R".({"a123", 1} startswith "a123").", QVariant(true)},
+        {R".({} startswith "A123").", QVariant(false)},
+        {R".("Hello world" startswith "Hello").", QVariant(true)},
+        {R".("Hello world" startswith "world").", QVariant(false)},
+        {R".({"a123", "b456"} endswith "b456").", QVariant(true)},
+        {R".({"a123", "b456"} endswith "B456").", QVariant(true)},
+        {R".("Hello world" endswith "world").", QVariant(true)},
+        {R".("Hello world" endswith "Hello").", QVariant(false)},
+        // Context map usage
+        {R".(author.name).", QVariant("icelys")},
+        {R".(!author.subbed).", QVariant(true)},
+        {R".(author.color == "#ff0000").", QVariant(true)},
+        {R".(channel.name == "forsen" && author.badges contains "moderator").",
+         QVariant(true)},
+        {R".(author.external_badges contains "frankerfacez:bot").",
+         QVariant(true)},
+        {R".(message.content match {r"(\d\d\d\d)\-(\d\d)\-(\d\d)", 3}).",
+         QVariant("19")},
+        {R".(message.content match {r"forsen", 3}).", QVariant("")},
+        {R".(message.content match r"HEY THERE").", QVariant(false)},
+        {R".(message.content match ri"HEY THERE").", QVariant(true)},
+    };
+
+    for (const auto &[input, expected] : tests)
+    {
+        auto filterResult = Filter::fromString(input);
+        bool isValid = std::holds_alternative<Filter>(filterResult);
+        ASSERT_TRUE(isValid)
+            << "Filter::fromString( " << input << " ) is invalid";
+
+        auto filter = std::move(std::get<Filter>(filterResult));
+        auto result = filter.execute(ctx);
+
+        EXPECT_EQ(result, expected)
+            << "Filter{ " << input << " } evaluated to " << result.toString()
+            << " instead of " << expected.toString()
+            << ".\nDebug: " << filter.debugString();
+    }
+}
+
+TEST(Filters, Identifier)
+{
+    for (const auto [identifier, _] : VALID_IDENTIFIERS_MAP.asKeyValueRange())
+    {
+        auto expr = createIdentifierExpression(identifier);
+        ASSERT_TRUE(isWellTyped(expr->synthesizeType()))
+            << "the identifier '" << identifier
+            << "' must create a well typed expression";
+    }
+}
+
+TEST_F(FiltersF, ExpressionDebug)
+{
+    struct TestCase {
+        QString input;
+        QString debugString;
+        QString filterString;
+    };
+
+    // clang-format off
+    std::vector<TestCase> tests{
+        {
+            .input = R".(1 + 1).",
+            .debugString = "BinaryOp[Plus](Val(1) : Int, Val(1) : Int)",
+            .filterString = "(1 + 1)",
+        },
+        {
+            .input = R".(author.color == "#ff0000").",
+            .debugString = "BinaryOp[Eq](Accessor(author.color) : Color, Val(#ff0000) : String)",
+            .filterString = R".((author.color == "#ff0000")).",
+        },
+        {
+            .input = R".(1).",
+            .debugString = "Val(1)",
+            .filterString = R".(1).",
+        },
+        {
+            .input = R".("asd").",
+            .debugString = R".(Val(asd)).",
+            .filterString = R".("asd").",
+        },
+        {
+            .input = R".(("asd")).",
+            .debugString = R".(Val(asd)).",
+            .filterString = R".("asd").",
+        },
+        {
+            .input = R".(author.subbed).",
+            .debugString = R".(Accessor(author.subbed)).",
+            .filterString = R".(author.subbed).",
+        },
+        {
+            .input = R".(!author.subbed).",
+            .debugString = R".(UnaryOp[Not](Accessor(author.subbed) : Bool)).",
+            .filterString = R".((!author.subbed)).",
+        },
+        {
+            .input = R".({"foo", "bar"} contains "foo").",
+            .debugString = R".(BinaryOp[Contains](List(Val(foo) : String, Val(bar) : String) : StringList, Val(foo) : String)).",
+            .filterString = R".(({"foo", "bar"} contains "foo")).",
+        },
+        {
+            .input = R".(!({"foo", "bar"} contains "foo")).",
+            .debugString = R".(UnaryOp[Not](BinaryOp[Contains](List(Val(foo) : String, Val(bar) : String) : StringList, Val(foo) : String) : Bool)).",
+            .filterString = R".((!({"foo", "bar"} contains "foo"))).",
+        },
+        {
+            .input = R".(message.content match r"(\d\d)/(\d\d)/(\d\d\d\d)").",
+            .debugString = R".(BinaryOp[Match](Accessor(message.content) : String, RegEx((\d\d)/(\d\d)/(\d\d\d\d)) : RegularExpression)).",
+            .filterString = R".((message.content match r"(\d\d)/(\d\d)/(\d\d\d\d)")).",
+        },
+    };
+    // clang-format on
+
+    for (const auto &[input, debugString, filterString] : tests)
+    {
+        const auto filterResult = Filter::fromString(input);
+        const auto *filter = std::get_if<Filter>(&filterResult);
+        EXPECT_NE(filter, nullptr) << "Filter::fromString(" << input
+                                   << ") did not build a proper filter";
+
+        const auto actualDebugString = filter->debugString();
+        EXPECT_EQ(actualDebugString, debugString)
+            << "filter->debugString() on '" << input << "' should be '"
+            << debugString << "', but got '" << actualDebugString << "'";
+
+        const auto actualFilterString = filter->filterString();
+        EXPECT_EQ(actualFilterString, filterString)
+            << "filter->filterString() on '" << input << "' should be '"
+            << filterString << "', but got '" << actualFilterString << "'";
+    }
+}

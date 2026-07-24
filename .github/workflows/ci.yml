@@ -1,0 +1,372 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      portable_artifacts:
+        description: Build portable application artifacts
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Fast policy and tooling preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify Python syntax
+        shell: bash
+        run: python3 -m compileall -q tools
+
+      - name: Run offline CI and integration policy tests
+        shell: bash
+        run: python3 -B -m unittest -v tools.tests.test_ci_policy tools.tests.test_pr_integration
+
+      - name: Run deterministic validator and Streamlink fixture tests
+        shell: bash
+        run: >-
+          python3 -B -m unittest -v
+          tools.tests.test_rumble_validation
+          tools.tests.test_rumble_streamlink
+          tools.tests.test_user_facing_string_audit
+
+  integration-state:
+    name: Verify live PR integration state
+    if: github.event_name == 'pull_request'
+    needs: preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Test integration policy
+        run: python3 -m unittest -v tools.tests.test_pr_integration
+
+      - name: Report live exact-head integration state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          python3 tools/pr_integration.py \
+            --repo "${GITHUB_REPOSITORY}" \
+            report --pr "${{ github.event.pull_request.number }}" \
+            --allow-draft \
+            --skip-check-readiness \
+            | tee -a "${GITHUB_STEP_SUMMARY}"
+
+  nix-contract:
+    name: Validate locked Nix contract (${{ matrix.attribute }})
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - attribute: chatterino-nix-package
+            operation: evaluate
+          - attribute: chatterino-windows-portable
+            operation: evaluate
+          - attribute: chatterino-linux-appimage
+            operation: evaluate
+          - attribute: rumble-validation
+            operation: build
+          - attribute: rumble-credential-storage
+            operation: build
+
+    steps:
+      - name: Check out repository and submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Record locked Nix environment
+        shell: bash
+        run: |
+          nix --version
+          nix flake metadata --no-write-lock-file
+
+      - name: Evaluate locked contract
+        if: matrix.operation == 'evaluate'
+        shell: bash
+        run: nix eval --raw ".#checks.x86_64-linux.${{ matrix.attribute }}.name"
+
+      - name: Build locked deterministic test
+        if: matrix.operation == 'build'
+        shell: bash
+        run: nix build --no-write-lock-file --print-build-logs ".#checks.x86_64-linux.${{ matrix.attribute }}"
+
+  full-nix-validation:
+    name: Build locked Nix validation contracts
+    needs: preflight
+    if: >-
+      github.ref == 'refs/heads/main' ||
+      (github.event_name == 'workflow_dispatch' && inputs.portable_artifacts) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'portable-artifacts'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository and submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build the repository-locked Chatterino package
+        shell: bash
+        run: |
+          nix build --no-write-lock-file --print-build-logs \
+            .#checks.x86_64-linux.chatterino-nix-package
+
+  portable-artifacts:
+    name: Build portable application artifacts
+    needs: preflight
+    if: >-
+      github.ref == 'refs/heads/main' ||
+      (github.event_name == 'workflow_dispatch' && inputs.portable_artifacts) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'portable-artifacts'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository and submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build and verify portable application artifacts
+        shell: bash
+        run: |
+          nix flake metadata --no-write-lock-file
+          nix build --no-write-lock-file --print-build-logs \
+            .#checks.x86_64-linux.chatterino-windows-portable \
+            -o result-windows-portable
+          nix build --no-write-lock-file --print-build-logs \
+            .#checks.x86_64-linux.chatterino-linux-appimage \
+            --no-link
+          nix build --no-write-lock-file --print-build-logs \
+            .#chatterino-linux-appimage \
+            -o result-linux-appimage
+          (cd result-windows-portable && sha256sum --check SHA256SUMS)
+          (cd result-linux-appimage && sha256sum --check SHA256SUMS)
+          mkdir -p portable-artifacts/windows portable-artifacts/linux
+          cp -RL result-windows-portable/. portable-artifacts/windows/
+          cp -RL result-linux-appimage/. portable-artifacts/linux/
+
+      - name: Upload portable application artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chatterino-portable-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: portable-artifacts/
+
+  tests:
+    name: Build and run Chatterino tests
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container: ghcr.io/chatterino/chatterino2-build-ubuntu-26.04@sha256:6300a42ea5c83f00bc8368eaa0cf31ab126247a5d88e3959f03ba0e9d181f50e # ubuntu-26.04
+
+    env:
+      QT_QPA_PLATFORM: minimal
+      CI_TEST_CONTAINER_IMAGE: ghcr.io/chatterino/chatterino2-build-ubuntu-26.04@sha256:6300a42ea5c83f00bc8368eaa0cf31ab126247a5d88e3959f03ba0e9d181f50e
+      HTTPBOX_TAG: v0.2.1
+      HTTPBOX_SHA256: bbb4de44c60f531dc4e37cd451c169837360239acd1abf5ffe70860d98adc5fa
+      TWITCH_PUBSUB_SERVER_TAG: v1.0.12
+      TWITCH_PUBSUB_SERVER_SHA256: effadf8c485dcfcde65ce6d53cf467e0813a2773f47640cfd76d59dfbfe6ab50
+
+    steps:
+      - name: Check out repository and submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Verify CI policy
+        shell: bash
+        run: python3 -B -m unittest -v tools.tests.test_ci_policy
+
+      - name: Record pinned test environment
+        shell: bash
+        run: |
+          cat /etc/os-release
+          printf 'test-container %s\n' "$CI_TEST_CONTAINER_IMAGE"
+          printf 'httpbox %s %s\n' "$HTTPBOX_TAG" "$HTTPBOX_SHA256"
+          printf 'twitch-pubsub-server %s %s\n' "$TWITCH_PUBSUB_SERVER_TAG" "$TWITCH_PUBSUB_SERVER_SHA256"
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            curl \
+            libbenchmark-dev \
+            qt6-image-formats-plugins \
+            qtkeychain-qt6-dev \
+            xz-utils
+
+      - name: Install HTTPBox
+        shell: bash
+        run: |
+          curl --fail --location \
+            --output /tmp/httpbox.tar.xz \
+            "https://github.com/Chatterino/httpbox/releases/download/${HTTPBOX_TAG}/httpbox-x86_64-unknown-linux-gnu.tar.xz"
+          printf '%s  %s\n' "$HTTPBOX_SHA256" /tmp/httpbox.tar.xz | sha256sum --check
+          tar -xJf /tmp/httpbox.tar.xz -C /tmp
+          install /tmp/httpbox-x86_64-unknown-linux-gnu/httpbox /usr/local/bin/httpbox
+
+      - name: Install Twitch PubSub test server
+        shell: bash
+        run: |
+          mkdir -p /tmp/pubsub-server-test
+          curl --fail --location \
+            --output /tmp/pubsub-server.tar.gz \
+            "https://github.com/Chatterino/twitch-pubsub-server-test/releases/download/${TWITCH_PUBSUB_SERVER_TAG}/server-${TWITCH_PUBSUB_SERVER_TAG}-linux-amd64.tar.gz"
+          printf '%s  %s\n' "$TWITCH_PUBSUB_SERVER_SHA256" /tmp/pubsub-server.tar.gz | sha256sum --check
+          tar -xzf /tmp/pubsub-server.tar.gz -C /tmp/pubsub-server-test
+
+      - name: Configure tests
+        shell: bash
+        run: |
+          cmake \
+            -S deps/chatterino7 \
+            -B build-test \
+            -DBUILD_TESTS=ON \
+            -DBUILD_BENCHMARKS=OFF \
+            -DBUILD_APP=OFF \
+            -DCMAKE_PREFIX_PATH="$Qt6_DIR/lib/cmake" \
+            -DCHATTERINO_STATIC_QT_BUILD=ON \
+            -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build tests
+        shell: bash
+        run: cmake --build build-test --parallel "$(nproc)"
+
+      - name: Run focused Rumble release matrix repeatedly
+        shell: bash
+        run: |
+          QT_QPA_PLATFORM=minimal ./build-test/bin/chatterino-test \
+            --gtest_filter='RumbleReleaseGate.*:RumbleAccount.*:RumbleAuth*.*:RumbleSend.*:RumbleChannelCapability.*:RumbleChannelModeration.*:RumbleSecretRedaction.*:RumbleModeration*.*:RumbleMultiChannelIntegration.*:RumbleDiagnostic*.*:RumbleRedaction.*:RumbleStatusCommand.*:RumbleLogCoalescing.*:RumbleFixtureLoader.ProvenanceCoversEveryRawResource:RumbleResolverParser.ToleratesBoundedUnrelatedHydrationMarkup:RumbleResolverParser.BodyAndSvgTitlesDoNotAmbiguateDocumentTitle:RumbleResolverParser.FirstVideoDurationIsAuthoritative:RumbleResolverTransport.CompletesFromPagePrefixBeforeOversizedTail:RumbleTransportQt.AppliesFixedPublicContextAndCredentialFreeAttributes:RumbleTransportQt.OrdersTerminalCallbacksAndClassifiesReplyErrors:RumbleTransportQt.EnforcesConcreteBodyAndHeaderBounds:RumbleTransportQt.BackpressuresPendingChunksAndSuppressesCancelledDelivery:RumbleTransportQt.DrainsSseBurstLargerThanPendingWindow:RumbleApiTransport.BodyLimitDiagnosticsIdentifyRequestStage:RumbleApiStream.UsesPersistentScopesAndOrdersBatchesBeforeCleanEof:RumbleApiBootstrap.ParsesBoundedEventsAndObservedMediaType:RumbleApiBootstrap.RejectsOversizedUnterminatedEventBeforeBodyLimit:RumbleLifecycle.BodyLimitUsesDistinctDiagnosticText:RumbleLifecycle.AccessInterstitialAndSchemaUseDistinctOperatorText-RumbleRedaction.ActualTransitionLogUsesOnlyClosedVocabulary' \
+            --gtest_repeat=10 \
+            --gtest_break_on_failure
+
+      - name: Run production emote catalog routing matrix repeatedly
+        shell: bash
+        run: |
+          QT_QPA_PLATFORM=minimal ./build-test/bin/chatterino-test \
+            --gtest_filter='MultiChannelCompletionRoutingRegression.Production*' \
+            --gtest_repeat=10 \
+            --gtest_break_on_failure
+
+      - name: Run tests once
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          set -uo pipefail
+          httpbox --port 9051 >/tmp/httpbox.log 2>&1 &
+          HTTPBOX_PID=$!
+          (
+            cd /tmp/pubsub-server-test
+            exec ./server 127.0.0.1:9050 127.0.0.1:9052
+          ) >/tmp/pubsub-server.log 2>&1 &
+          PUBSUB_PID=$!
+          trap 'kill "$HTTPBOX_PID" "$PUBSUB_PID" 2>/dev/null || true' EXIT
+          tools/ci/run-required-ctest --test-dir build-test --output-on-failure \
+            --output-junit "$GITHUB_WORKSPACE/test-results.xml"
+
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chatterino-test-diagnostics
+          if-no-files-found: warn
+          path: |
+            test-results.xml
+            build-test/Testing/**
+            /tmp/ctest.log
+            /tmp/httpbox.log
+            /tmp/pubsub-server.log
+
+  required:
+    name: Required PR gate
+    if: always()
+    needs:
+      - preflight
+      - integration-state
+      - nix-contract
+      - tests
+      - full-nix-validation
+      - portable-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful validation and tests
+        shell: bash
+        env:
+          INTEGRATION_STATE_RESULT: ${{ needs.integration-state.result }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          NIX_CONTRACT_RESULT: ${{ needs.nix-contract.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+          FULL_NIX_RESULT: ${{ needs.full-nix-validation.result }}
+          ARTIFACTS_RESULT: ${{ needs.portable-artifacts.result }}
+        run: |
+          test "$PREFLIGHT_RESULT" = success
+          if [[ "$EVENT_NAME" = pull_request ]]; then
+            test "$INTEGRATION_STATE_RESULT" = success
+          else
+            test "$INTEGRATION_STATE_RESULT" = skipped
+          fi
+          test "$NIX_CONTRACT_RESULT" = success
+          test "$TESTS_RESULT" = success
+          test "$FULL_NIX_RESULT" = success || test "$FULL_NIX_RESULT" = skipped
+          test "$ARTIFACTS_RESULT" = success || test "$ARTIFACTS_RESULT" = skipped
+
+  legacy-nix-package:
+    name: Build Nix package
+    if: always()
+    needs: required
+    runs-on: ubuntu-latest
+    steps:
+      - name: Preserve the legacy required-check context during rollout
+        shell: bash
+        run: test "${{ needs.required.result }}" = success
