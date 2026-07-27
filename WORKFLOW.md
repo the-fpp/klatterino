@@ -12,6 +12,7 @@ pipeline:
       model: gpt-5.3-codex-spark
       on:
         completed: stage-2
+        infrastructure: stage-3
       role: implement
       session: stage-1
       state: In Progress
@@ -23,6 +24,7 @@ pipeline:
           model: gpt-5.6-luna
           on:
             completed: stage-2.substate-1
+            infrastructure: stage-3
         substate-2:
           inputs:
           - output: ci_failures
@@ -30,6 +32,7 @@ pipeline:
           model: gpt-5.6-terra
           on:
             completed: stage-2.substate-2
+            infrastructure: stage-3
         substate-3:
           inputs:
           - output: ci_failures
@@ -37,6 +40,7 @@ pipeline:
           model: gpt-5.6-sol
           on:
             completed: stage-2.substate-3
+            infrastructure: stage-3
       type: agent
     stage-2:
       command: cargo test
@@ -51,21 +55,23 @@ pipeline:
       substates:
         substate-1:
           on:
+            infrastructure: stage-3
             matched: stage-4
             mismatched: stage-1.substate-2
         substate-2:
           on:
+            infrastructure: stage-3
             matched: stage-4.substate-1
             mismatched: stage-6
         substate-3:
           on:
+            infrastructure: stage-3
             matched: stage-4.substate-2
       timeout_ms: 1800000
       type: ci
       workflow: ci.yml
     stage-3:
       outcome: escalate
-      reason: Error
       state: Error
       type: terminal
     stage-4:
@@ -74,6 +80,7 @@ pipeline:
       on:
         accepted: stage-4.substate-1
         blocked: stage-3
+        infrastructure: stage-3
         rejected: stage-1.substate-1
       role: check
       session: stage-4
@@ -111,6 +118,10 @@ pipeline:
       type: extractor
     stage-6:
       outcome: escalate
+      report:
+        project: user:ricyje:4
+        repository: ricyje/orchestrator
+        state: Todo
       state: Failure
       type: terminal
     stage-7:
